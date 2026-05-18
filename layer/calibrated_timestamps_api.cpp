@@ -38,7 +38,7 @@ wsi_layer_vkGetCalibratedTimestampsEXT(VkDevice device, uint32_t timestampCount,
 {
    auto &device_data = layer::device_private_data::get(device);
    auto get_calibrated_timestamps =
-      device_data.disp.get_fn<PFN_vkGetCalibratedTimestampsEXT>("PFN_vkGetCalibratedTimestampsEXT").has_value() ?
+      device_data.disp.get_fn<PFN_vkGetCalibratedTimestampsEXT>("vkGetCalibratedTimestampsEXT").has_value() ?
          device_data.disp.get_fn<PFN_vkGetCalibratedTimestampsEXT>("vkGetCalibratedTimestampsEXT") :
          device_data.disp.get_fn<PFN_vkGetCalibratedTimestampsEXT>("vkGetCalibratedTimestampsKHR");
    assert(get_calibrated_timestamps.has_value());
