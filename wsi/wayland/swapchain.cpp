@@ -65,6 +65,7 @@ swapchain::swapchain(layer::device_private_data &dev_data, const VkAllocationCal
    , m_buffer_queue(nullptr)
    , m_wsi_allocator(nullptr)
    , m_image_creation_parameters({}, m_allocator, {}, {})
+   , m_has_alpha(false)
 {
    m_image_create_info.format = VK_FORMAT_UNDEFINED;
 }
@@ -171,6 +172,9 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
    use_presentation_thread =
       WAYLAND_FIFO_PRESENTATION_THREAD_ENABLED && (m_present_mode != VK_PRESENT_MODE_MAILBOX_KHR);
 
+   m_has_alpha =
+      (swapchain_create_info->compositeAlpha == VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR);
+
    return VK_SUCCESS;
 }
 
@@ -210,7 +214,7 @@ VkResult swapchain::get_surface_compatible_formats(const VkImageCreateInfo &info
    for (const auto &prop : drm_format_props)
    {
       bool is_supported = false;
-      drm_format_pair drm_format{ util::drm::vk_to_drm_format(info.format), prop.drmFormatModifier };
+      drm_format_pair drm_format{ util::drm::vk_to_drm_format_with_alpha(info.format, m_has_alpha), prop.drmFormatModifier };
 
       for (const auto &format : m_wsi_surface->get_formats())
       {
@@ -442,7 +446,7 @@ VkResult swapchain::create_wl_buffer(const VkImageCreateInfo &image_create_info,
                                      image_data->external_mem.get_strides()[plane], modifier_hi, modifier_low);
    }
 
-   const auto fourcc = util::drm::vk_to_drm_format(image_create_info.format);
+   const auto fourcc = util::drm::vk_to_drm_format_with_alpha(image_create_info.format, m_has_alpha);
    assert(image_create_info.extent.width <= INT32_MAX);
    assert(image_create_info.extent.height <= INT32_MAX);
    image_data->buffer = zwp_linux_buffer_params_v1_create_immed(params, image_create_info.extent.width,

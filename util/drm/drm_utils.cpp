@@ -120,5 +120,25 @@ uint32_t drm_fourcc_format_get_num_planes(uint32_t format)
    }
 }
 
+/* Get drm_format with alpha channel */
+uint32_t vk_to_drm_format_with_alpha(VkFormat vk_format, bool has_alpha)
+{
+   uint32_t drm_format = vk_to_drm_format(vk_format);
+   if (!has_alpha)
+   {
+      switch (drm_format)
+      {
+      case DRM_FORMAT_ARGB8888:
+         return DRM_FORMAT_XRGB8888;
+      case DRM_FORMAT_ABGR8888:
+         return DRM_FORMAT_XBGR8888;
+      default:
+         return drm_format;
+      }
+   }
+
+   return drm_format;
+}
+
 } // namespace drm
 } // namespace util

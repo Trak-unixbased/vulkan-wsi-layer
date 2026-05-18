@@ -57,7 +57,9 @@ const fmt_spec fourcc_format_table[] = {
    { DRM_FORMAT_RGBA8888, 1, { 32, 0, 0, 0 }, VK_FORMAT_UNDEFINED },
    { DRM_FORMAT_BGRA8888, 1, { 32, 0, 0, 0 }, VK_FORMAT_UNDEFINED },
 
-   { DRM_FORMAT_ABGR2101010, 1, { 32, 0, 0, 0 }, VK_FORMAT_A2B10G10R10_UNORM_PACK32 },
+   /* Disable ABGR2101010 as it causes numerous issues on Linux
+    * Need to check with ARM for more informantion */
+   // { DRM_FORMAT_ABGR2101010, 1, { 32, 0, 0, 0 }, VK_FORMAT_A2B10G10R10_UNORM_PACK32 },
 };
 
 const fmt_spec srgb_fourcc_format_table[] = {

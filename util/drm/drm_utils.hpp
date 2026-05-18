@@ -35,6 +35,7 @@ uint32_t vk_to_drm_format(VkFormat vk_format);
 VkFormat drm_to_vk_format(uint32_t drm_format);
 VkFormat drm_to_vk_srgb_format(uint32_t drm_format);
 uint32_t drm_fourcc_format_get_num_planes(uint32_t format);
+uint32_t vk_to_drm_format_with_alpha(VkFormat vk_format, bool has_alpha);
 
 } // namespace drm
 } // namespace util

@@ -150,7 +150,7 @@ VkResult swapchain::get_surface_compatible_formats(const VkImageCreateInfo &info
 
    for (const auto &prop : drm_format_props)
    {
-      drm_format_pair drm_format{ util::drm::vk_to_drm_format(info.format), prop.drmFormatModifier };
+      drm_format_pair drm_format{ util::drm::(info.format), prop.drmFormatModifier };
 
       if (!display->is_format_supported(drm_format))
       {
