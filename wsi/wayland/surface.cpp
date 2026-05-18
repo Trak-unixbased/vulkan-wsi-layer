@@ -69,6 +69,10 @@ zwp_linux_dmabuf_v1_modifier_impl(void *data, struct zwp_linux_dmabuf_v1 *dma_bu
 
    if (!drm_supported_formats->is_out_of_memory)
    {
+      // DPTSW-10255 Menu and task bar disappear.
+      // wlroots will send DRM_FORMAT_MOD_INVALID when only DRM_FORMAT_MOD_INVALID and DRM_FORMAT_MOD_LINEAR
+      // are supported. But Mali DDK doesn't support DRM_FORMAT_MOD_INVALID, so replace it with DRM_FORMAT_MOD_LINEAR.
+      format.modifier = (format.modifier == DRM_FORMAT_MOD_INVALID) ? DRM_FORMAT_MOD_LINEAR : format.modifier;
       drm_supported_formats->is_out_of_memory = !drm_supported_formats->formats->try_push_back(format);
    }
 }
