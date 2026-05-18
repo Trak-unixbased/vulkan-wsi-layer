@@ -58,7 +58,6 @@ void swapchain_base::page_flip_thread()
    auto &sc_images = m_swapchain_images;
    VkResult vk_res = VK_SUCCESS;
    uint64_t timeout = UINT64_MAX;
-   constexpr uint64_t SEMAPHORE_TIMEOUT = 250000000; /* 250 ms. */
 
    /* No mutex is needed for the accesses to m_page_flip_thread_run variable as after the variable is
     * initialized it is only ever changed to false. The while loop will make the thread read the
@@ -76,7 +75,7 @@ void swapchain_base::page_flip_thread()
          {
             vk_res = VK_SUCCESS;
          }
-         else if ((vk_res = m_page_flip_semaphore.wait(SEMAPHORE_TIMEOUT)) == VK_TIMEOUT)
+         else if ((vk_res = m_page_flip_semaphore.wait(100000000)) == VK_TIMEOUT)
          {
             /* Image is not ready yet. */
             continue;
@@ -91,9 +90,10 @@ void swapchain_base::page_flip_thread()
       {
          /* Waiting for the page_flip_semaphore which will be signalled once there is an
           * image to display.*/
-         if ((vk_res = m_page_flip_semaphore.wait(SEMAPHORE_TIMEOUT)) == VK_TIMEOUT)
+         if ((vk_res = m_page_flip_semaphore.wait(100000000)) == VK_TIMEOUT)
          {
             /* Image is not ready yet. */
+            update_pending_image_status();
             continue;
          }
 
@@ -703,7 +703,7 @@ void swapchain_base::wait_for_pending_buffers()
 {
    std::unique_lock<std::mutex> acquire_lock(m_image_acquire_lock);
    int wait;
-   int acquired_images = 0;
+   int acquired_images = 0, invalid_image = 0;
    std::unique_lock<std::recursive_mutex> image_status_lock(m_image_status_mutex);
 
    for (auto &img : m_swapchain_images)
@@ -712,19 +712,27 @@ void swapchain_base::wait_for_pending_buffers()
       {
          acquired_images++;
       }
+      else if (img.status == swapchain_image::INVALID)
+      {
+         // Invalid image should not be counted for waiting.
+         invalid_image++;
+      }
    }
 
    /* Waiting for free images waits for both free and pending. One pending image may be presented and acquired by a
     * compositor. The WSI backend may not necessarily know which pending image is presented to change its state. It may
     * be impossible to wait for that one presented image. */
-   wait = static_cast<int>(m_swapchain_images.size()) - acquired_images - 1;
+   wait = static_cast<int>(m_swapchain_images.size()) - acquired_images - invalid_image - 1;
    image_status_lock.unlock();
 
    while (wait > 0)
    {
       /* Take down one free image semaphore. */
-      wait_for_free_buffer(UINT64_MAX);
-      --wait;
+      // Check every 0.1ms to see if compositor free the pending images.
+      if (wait_for_free_buffer(100000000) == VK_SUCCESS)
+      {
+         --wait;
+      }
    }
 }
 

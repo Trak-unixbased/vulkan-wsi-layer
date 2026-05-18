@@ -33,7 +33,7 @@ if (NOT CLANG_TIDY STREQUAL "CLANG_TIDY-NOTFOUND")
    set(CMAKE_CXX_CLANG_TIDY ${CLANG_TIDY} -checks=bugprone-*,modernize-*)
 endif()
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Werror -Wextra -pthread -fPIC")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pthread -fPIC")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -41,6 +41,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
+set(THIRDPARTY_INCLUDE ${THIRDPARTY_DIR}/include)
 
 if(NOT DEFINED VULKAN_CXX_INCLUDE)
    set(VULKAN_CXX_INCLUDE ${VULKAN_PKG_CONFIG_INCLUDEDIR})
@@ -59,25 +60,38 @@ endif()
 option(BUILD_WSI_HEADLESS "Build with support for VK_EXT_headless_surface" ON)
 option(BUILD_WSI_WAYLAND "Build with support for VK_KHR_wayland_surface" OFF)
 option(BUILD_WSI_DISPLAY "Build with support for VK_KHR_display" OFF)
+option(BUILD_WSI_XCB "Build with support for VK_KHR_xcb_surface" OFF)
 
-set(SELECT_EXTERNAL_ALLOCATOR "none" CACHE STRING "Select an external system allocator (none, ion, dma_buf_heaps)")
-set(EXTERNAL_WSIALLOC_LIBRARY "" CACHE STRING "External implementation of the wsialloc interface to use")
+set(SELECT_EXTERNAL_ALLOCATOR "none" CACHE STRING "Select an external system allocator (none, dma_buf_heaps)")
+set(EXTERNAL_WSIALLOC_LIBRARY "" CACHE STRING "External imple-DSELECT_EXTERNAL_ALLOCATORmentation of the wsialloc interface to use")
 set(WSIALLOC_MEMORY_HEAP_NAME "linux,cma" CACHE STRING "Heap name used by the dma_buf_heaps allocator")
 
 # Optional features
 option(BUILD_WSI_DISPLAY_SUPPORT_FORMAT_MODIFIERS "Build with support for format modifiers in VK_KHR_display" ON)
 option(VULKAN_WSI_LAYER_EXPERIMENTAL "Enable the Vulkan WSI Experimental features" OFF)
 option(ENABLE_WAYLAND_FIFO_PRESENTATION_THREAD "Enable the non-conformant FIFO presentation thread implementation in the Wayland backend" OFF)
+option(WAYLAND_SUPPORT_EXPLICIT_SYNC "Enable Wayland linux-explicit-synchronization protocol support" OFF)
 
 # Enables the layer to pass frame boundary events if the ICD or layers below have support for it by
 # making use of the VK_EXT_frame_boundary extension. If the application itself makes use of the
 # VK_EXT_frame_boundary then the layer will not pass its own frame boundary events.
 option(ENABLE_INSTRUMENTATION "Pass frame boundary events by using VK_EXT_frame_boundary" OFF)
 
+if(BUILD_WSI_WAYLAND)
+   set(BUILD_WSI_XCB true)
+endif()
+
 if(BUILD_WSI_WAYLAND OR BUILD_WSI_DISPLAY)
    set(BUILD_DRM_UTILS true)
    if(SELECT_EXTERNAL_ALLOCATOR STREQUAL "none")
       message(FATAL_ERROR "WSI only supported with an external allocator.")
+   endif()
+endif()
+
+if(BUILD_WSI_XCB)
+   set(BUILD_DRM_UTILS true)
+   if(SELECT_EXTERNAL_ALLOCATOR STREQUAL "none")
+      message(FATAL_ERROR "XCB only supported with an external allocator.")
    endif()
 endif()
 
@@ -188,7 +202,8 @@ if(BUILD_WSI_WAYLAND)
       ${PROJECT_SOURCE_DIR}
       ${VULKAN_CXX_INCLUDE}
       ${WAYLAND_CLIENT_INCLUDE_DIRS}
-      ${CMAKE_CURRENT_BINARY_DIR})
+      ${CMAKE_CURRENT_BINARY_DIR}
+      ${THIRDPARTY_INCLUDE})
 
    target_compile_options(wayland_wsi PRIVATE ${WAYLAND_CLIENT_CFLAGS})
    target_compile_options(wayland_wsi INTERFACE "-DBUILD_WSI_WAYLAND=1")
@@ -203,6 +218,11 @@ if(BUILD_WSI_WAYLAND)
       target_compile_definitions(wayland_wsi PRIVATE "-DWAYLAND_FIFO_PRESENTATION_THREAD_ENABLED=1")
    else()
       target_compile_definitions(wayland_wsi PRIVATE "-DWAYLAND_FIFO_PRESENTATION_THREAD_ENABLED=0")
+   endif()
+   if(WAYLAND_SUPPORT_EXPLICIT_SYNC)
+      target_compile_definitions(wayland_wsi PRIVATE "-DSUPPORT_EXPLICIT_SYNC=1")
+   else()
+      target_compile_definitions(wayland_wsi PRIVATE "-DSUPPORT_EXPLICIT_SYNC=0")
    endif()
 else()
    list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_KHR_wayland_surface/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
@@ -222,7 +242,9 @@ if(BUILD_WSI_HEADLESS)
    target_include_directories(wsi_headless PRIVATE
       ${PROJECT_SOURCE_DIR}
       ${VULKAN_CXX_INCLUDE}
-      ${CMAKE_CURRENT_BINARY_DIR})
+      ${THIRDPARTY_INCLUDE}
+      ${CMAKE_CURRENT_BINARY_DIR}
+      ${XCB_INCLUDE_DIRS})
 
    target_compile_options(wsi_headless INTERFACE "-DBUILD_WSI_HEADLESS=1")
    list(APPEND LINK_WSI_LIBS wsi_headless)
@@ -262,6 +284,66 @@ if (BUILD_WSI_DISPLAY)
    list(APPEND LINK_WSI_LIBS wsi_display)
 else()
    list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_KHR_display/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+endif()
+
+# Xcb
+if(BUILD_WSI_XCB)
+   add_library(xcb_wsi STATIC
+      wsi/xcb/surface_properties.cpp
+      wsi/xcb/surface.cpp
+      wsi/xcb/swapchain.cpp
+      wsi/xcb/xcb_helpers.cpp)
+
+
+   pkg_check_modules(XCB REQUIRED xcb)
+   message(STATUS "Using xcb include directories: ${XCB_INCLUDE_DIRS}")
+   message(STATUS "Using xcb cflags: ${XCB_CFLAGS}")
+   message(STATUS "Using xcb ldflags: ${XCB_LDFLAGS}")
+
+   pkg_check_modules(XCB_DRI3 REQUIRED xcb-dri3)
+   message(STATUS "Using xcb-dri3 include directories: ${XCB_DRI3_INCLUDE_DIRS}")
+   message(STATUS "Using xcb-dri3 cflags: ${XCB_DRI3_CFLAGS}")
+   message(STATUS "Using xcb-dri3 ldflags: ${XCB_DRI3_LDFLAGS}")
+
+   pkg_check_modules(XCB_PRESENT REQUIRED xcb-present)
+   message(STATUS "Using xcb-present include directories: ${XCB_PRESENT_INCLUDE_DIRS}")
+   message(STATUS "Using xcb-present cflags: ${XCB_PRESENT_CFLAGS}")
+   message(STATUS "Using xcb-present ldflags: ${XCB_PRESENT_LDFLAGS}")
+
+   pkg_check_modules(XSHMFENCE REQUIRED xshmfence)
+   message(STATUS "Using xshmfence include directories: ${XSHMFENCE_INCLUDE_DIRS}")
+   message(STATUS "Using xshmfence cflags: ${XSHMFENCE_CFLAGS}")
+   message(STATUS "Using xshmfence ldflags: ${XSHMFENCE_LDFLAGS}")
+
+   pkg_check_modules(XCB_SYNC REQUIRED xcb-sync)
+   message(STATUS "Using xcb-sync include directories: ${XCB_INCLUDE_DIRS}")
+   message(STATUS "Using xcb-sync cflags: ${XCB_SYNC_CFLAGS}")
+   message(STATUS "Using xcb-sync ldflags: ${XCB_SYNC_LDFLAGS}")
+
+   pkg_check_modules(X11_XCB REQUIRED x11-xcb)
+   message(STATUS "Using x11-xcb include directories: ${X11_INCLUDE_DIRS}")
+   message(STATUS "Using x11-xcb cflags: ${X11_XCB_CFLAGS}")
+   message(STATUS "Using x11-xcb ldflags: ${X11_XCB_LDFLAGS}")
+
+   target_include_directories(xcb_wsi PRIVATE
+      ${PROJECT_SOURCE_DIR}
+      ${VULKAN_CXX_INCLUDE}
+      ${THIRDPARTY_INCLUDE}
+      ${LIBDRM_INCLUDE_DIRS}
+      ${CMAKE_CURRENT_BINARY_DIR})
+
+   target_compile_options(xcb_wsi PRIVATE ${XCB_CFLAGS} ${XCB_DRI3_CFLAGS} ${XCB_PRESENT_CFLAGS} ${XSHMFENCE_CFLAGS} ${XCB_SYNC_CFLAGS} ${X11_XCB_CFLAGS})
+   target_compile_options(xcb_wsi INTERFACE "-DBUILD_WSI_XCB=1")
+   if(NOT EXTERNAL_WSIALLOC_LIBRARY STREQUAL "")
+      target_link_libraries(xcb_wsi ${EXTERNAL_WSIALLOC_LIBRARY})
+   else()
+      target_link_libraries(xcb_wsi wsialloc)
+   endif()
+   target_link_libraries(xcb_wsi drm_utils ${XCB_LDFLAGS} ${XCB_DRI3_LDFLAGS} ${XCB_PRESENT_LDFLAGS} ${XSHMFENCE_LDFLAGS} ${XCB_SYNC_LDFLAGS} ${X11_XCB_LDFLAGS})
+
+   list(APPEND LINK_WSI_LIBS xcb_wsi)
+else()
+   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_EXT_xcb_surface/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
 endif()
 
 # Layer

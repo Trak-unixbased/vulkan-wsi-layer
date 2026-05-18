@@ -232,7 +232,7 @@ bool surface::init()
       WSI_LOG_ERROR("Failed to obtain zwp_linux_dma_buf_v1 interface.");
       return false;
    }
-
+#if SUPPORT_EXPLICIT_SYNC
    if (explicit_sync_interface.get() == nullptr)
    {
       WSI_LOG_ERROR("Failed to obtain zwp_linux_explicit_synchronization_v1 interface.");
@@ -254,7 +254,7 @@ bool surface::init()
    }
 
    surface_sync_interface.reset(surface_sync_obj);
-
+#endif
    VkResult vk_res = get_supported_formats_and_modifiers(wayland_display, surface_queue.get(), dmabuf_interface.get(),
                                                          supported_formats);
    if (vk_res != VK_SUCCESS)

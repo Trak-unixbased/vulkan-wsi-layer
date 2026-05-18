@@ -337,8 +337,11 @@ static bool check_wl_protocols(struct wl_display *display)
       WSI_LOG_ERROR("Roundtrip failed.");
       return false;
    }
-
+#if SUPPORT_EXPLICIT_SYNC
    return (supported.dmabuf && supported.explicit_sync);
+#else
+   return (supported.dmabuf);
+#endif
 }
 
 VWL_VKAPI_CALL(VkBool32)

@@ -36,6 +36,10 @@
 #include <vulkan/vk_layer.h>
 #include <vulkan/vk_icd.h>
 #include <vulkan/vulkan_wayland.h>
+#include <xcb/xcb.h>
+#include <X11/Xlib.h>
+#include <vulkan/vulkan_xcb.h>
+#include <vulkan/vulkan_xlib.h>
 
 #include <memory>
 #include <unordered_set>
@@ -230,6 +234,12 @@ static constexpr uint32_t API_VERSION_MAX = UINT32_MAX;
    EP(CreateHeadlessSurfaceEXT, VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )                         \
    /* VK_KHR_wayland_surface */                                                                                           \
    EP(CreateWaylandSurfaceKHR, VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )                           \
+   /* VK_KHR_xcb_surface */                                                                                               \
+   EP(CreateXcbSurfaceKHR, VK_KHR_XCB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )                                     \
+   EP(GetPhysicalDeviceXcbPresentationSupportKHR, VK_KHR_XCB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )              \
+   /* VK_KHR_xlib_surface */                                                                                              \
+   EP(CreateXlibSurfaceKHR, VK_KHR_XLIB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )                                   \
+   EP(GetPhysicalDeviceXlibPresentationSupportKHR, VK_KHR_XLIB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )            \
    /* VK_KHR_display */                                                                                                   \
    EP(CreateDisplayPlaneSurfaceKHR, VK_KHR_DISPLAY_EXTENSION_NAME, API_VERSION_MAX, false, )                              \
    /* VK_KHR_get_surface_capabilities2 */                                                                                 \
@@ -378,6 +388,8 @@ private:
    EP(GetImageMemoryRequirements, "", VK_API_VERSION_1_0, true, )                                                           \
    EP(BindImageMemory, "", VK_API_VERSION_1_0, true, )                                                                      \
    EP(AllocateMemory, "", VK_API_VERSION_1_0, true, )                                                                       \
+   EP(MapMemory, "", VK_API_VERSION_1_0, true, )                                                                              \
+   EP(UnmapMemory, "", VK_API_VERSION_1_0, true, )                                                                            \
    EP(FreeMemory, "", VK_API_VERSION_1_0, true, )                                                                           \
    EP(CreateFence, "", VK_API_VERSION_1_0, true, )                                                                          \
    EP(DestroyFence, "", VK_API_VERSION_1_0, true, )                                                                         \

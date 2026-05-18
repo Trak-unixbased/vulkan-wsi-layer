@@ -50,6 +50,11 @@
 #include "display/surface_properties.hpp"
 #endif
 
+#if BUILD_WSI_XCB
+#include <vulkan/vulkan_xcb.h>
+#include "xcb/surface_properties.hpp"
+#endif
+
 namespace wsi
 {
 
@@ -66,6 +71,10 @@ static struct wsi_extension
 #endif
 #if BUILD_WSI_DISPLAY
    { { VK_KHR_DISPLAY_EXTENSION_NAME, VK_KHR_DISPLAY_SPEC_VERSION }, VK_ICD_WSI_PLATFORM_DISPLAY },
+#endif
+#if BUILD_WSI_XCB
+   { { VK_KHR_XCB_SURFACE_EXTENSION_NAME, VK_KHR_XCB_SURFACE_SPEC_VERSION }, VK_ICD_WSI_PLATFORM_XCB },
+   { { VK_KHR_XLIB_SURFACE_EXTENSION_NAME, VK_KHR_XLIB_SURFACE_SPEC_VERSION }, VK_ICD_WSI_PLATFORM_XLIB },
 #endif
 };
 
@@ -84,6 +93,11 @@ static surface_properties *get_surface_properties(VkIcdWsiPlatform platform)
 #if BUILD_WSI_DISPLAY
    case VK_ICD_WSI_PLATFORM_DISPLAY:
       return &display::surface_properties::get_instance();
+#endif
+#if BUILD_WSI_XCB
+   case VK_ICD_WSI_PLATFORM_XCB:
+   case VK_ICD_WSI_PLATFORM_XLIB:
+      return &xcb::surface_properties::get_instance();
 #endif
    default:
       return nullptr;

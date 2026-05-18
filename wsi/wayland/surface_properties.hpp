@@ -24,6 +24,10 @@
 
 #pragma once
 
+#ifndef SUPPORT_EXPLICIT_SYNC
+#define SUPPORT_EXPLICIT_SYNC 0
+#endif
+
 #include "wsi/surface_properties.hpp"
 #include "util/unordered_set.hpp"
 #include "wsi/compatible_present_modes.hpp"

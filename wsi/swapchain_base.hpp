@@ -559,6 +559,15 @@ protected:
       return VK_SUCCESS;
    }
 
+    /**
+    * @brief update pending image status if it is freed by the compositor
+
+    *
+    * Check to the compositor if the pending image is released to the drvier.
+    *
+    */
+   virtual void update_pending_image_status() {};
+
    /**
     * @brief Sets the present payload for a swapchain image.
     *

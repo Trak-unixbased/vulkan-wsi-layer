@@ -550,7 +550,7 @@ void swapchain::present_image(const pending_present_request &pending_present)
    }
 
    wl_surface_attach(m_surface, image_data->buffer, 0, 0);
-
+#if SUPPORT_EXPLICIT_SYNC
    auto present_sync_fd = image_data->present_fence.export_sync_fd();
    if (!present_sync_fd.has_value())
    {
@@ -562,7 +562,7 @@ void swapchain::present_image(const pending_present_request &pending_present)
       zwp_linux_surface_synchronization_v1_set_acquire_fence(m_wsi_surface->get_surface_sync_interface(),
                                                              present_sync_fd->get());
    }
-
+#endif
    /* TODO: work out damage */
    wl_surface_damage(m_surface, 0, 0, INT32_MAX, INT32_MAX);
 
@@ -711,11 +711,12 @@ VkResult swapchain::image_set_present_payload(swapchain_image &image, VkQueue qu
    return image_data->present_fence.set_payload(queue, semaphores, submission_pnext);
 }
 
-VkResult swapchain::image_wait_present(swapchain_image &, uint64_t)
+VkResult swapchain::image_wait_present(swapchain_image &image, uint64_t timeout)
 {
-   /* With explicit sync in use there is no need to wait for the present sync before submiting the image to the
-    * compositor. */
-   return VK_SUCCESS;
+#if !SUPPORT_EXPLICIT_SYNC
+   auto image_data = reinterpret_cast<wayland_image_data *>(image.data);
+   return image_data->present_fence.wait_payload(timeout);
+#endif
 }
 
 VkResult swapchain::bind_swapchain_image(VkDevice &device, const VkBindImageMemoryInfo *bind_image_mem_info,
