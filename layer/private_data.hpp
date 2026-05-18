@@ -221,6 +221,7 @@ static constexpr uint32_t API_VERSION_MAX = UINT32_MAX;
    /* Vulkan 1.0 */                                                                                                       \
    EP(GetInstanceProcAddr, "", VK_API_VERSION_1_0, true, )                                                                \
    EP(DestroyInstance, "", VK_API_VERSION_1_0, true, )                                                                    \
+   EP(EnumeratePhysicalDevices, "", VK_API_VERSION_1_0, true, )                                                             \
    EP(GetPhysicalDeviceProperties, "", VK_API_VERSION_1_0, true, )                                                        \
    EP(GetPhysicalDeviceImageFormatProperties, "", VK_API_VERSION_1_0, true, )                                             \
    EP(EnumerateDeviceExtensionProperties, "", VK_API_VERSION_1_0, true, )                                                 \

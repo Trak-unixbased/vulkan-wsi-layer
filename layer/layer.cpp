@@ -205,6 +205,75 @@ VKAPI_ATTR VkResult create_instance(const VkInstanceCreateInfo *pCreateInfo, con
    return VK_SUCCESS;
 }
 
+VKAPI_ATTR VkResult enumerate_physical_devices(VkInstance                                  instance,
+                                               uint32_t*                                   pPhysicalDeviceCount,
+                                               VkPhysicalDevice*                           pPhysicalDevices)
+{
+   if (instance == VK_NULL_HANDLE)
+   {
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+
+   auto &inst_data = layer::instance_private_data::get(instance);
+   auto alloc = inst_data.get_allocator();
+   auto fn_enumerate_physical_devices = inst_data.disp.get_fn<PFN_vkEnumeratePhysicalDevices>("vkEnumeratePhysicalDevices");
+
+   // Get physical device count
+   uint32_t layer_physical_device_count = 0;
+   assert(fn_enumerate_physical_devices.has_value());
+   TRY_LOG((*fn_enumerate_physical_devices)(instance, &layer_physical_device_count, NULL), "Failed to get physical device count");
+   if (layer_physical_device_count == 0)
+   {
+      return VK_INCOMPLETE;
+   }
+
+   // Enumerate physical devices
+   VkPhysicalDevice *layer_physical_devices = alloc.create<VkPhysicalDevice>(layer_physical_device_count);
+   if (layer_physical_devices == NULL)
+   {
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   TRY_LOG((*fn_enumerate_physical_devices)(instance, &layer_physical_device_count, layer_physical_devices), "Failed to enumerate physical devices");
+
+   VkPhysicalDeviceProperties* layer_phyical_device_properties = alloc.create<VkPhysicalDeviceProperties>(layer_physical_device_count);
+   if (layer_phyical_device_properties == NULL)
+   {
+      alloc.destroy<VkPhysicalDevice>(layer_physical_device_count, layer_physical_devices);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   uint32_t return_physcial_device_count = 0;
+   for (uint32_t i = 0; i < layer_physical_device_count; ++i)
+   {
+      // Get the physical device properties
+      layer::instance_private_data::get(layer_physical_devices[i]).disp.GetPhysicalDeviceProperties(layer_physical_devices[i], &layer_phyical_device_properties[i]);
+      // Add only Mali-G720-Immortalis device to the list of returned physical devices
+      if (layer_phyical_device_properties[i].vendorID == 0x13b5 &&
+         strcmp(layer_phyical_device_properties[i].deviceName,"Mali-G720-Immortalis") == 0)
+      {
+         if (pPhysicalDevices != NULL)
+         {
+            pPhysicalDevices[return_physcial_device_count++] = layer_physical_devices[i];
+         }
+         else
+         {
+            return_physcial_device_count++;
+         }
+      }
+      else
+      {
+         WSI_LOG_WARNING("WSI layer doesn't support this physcial device: vendorID: 0x%x deviceName: %s\n",
+                         layer_phyical_device_properties[i].vendorID,
+                         layer_phyical_device_properties[i].deviceName);
+      }
+   }
+   *pPhysicalDeviceCount = return_physcial_device_count;
+
+   alloc.destroy<VkPhysicalDevice>(layer_physical_device_count, layer_physical_devices);
+   alloc.destroy<VkPhysicalDeviceProperties>(layer_physical_device_count, layer_phyical_device_properties);
+   return VK_SUCCESS;
+}
+
 VKAPI_ATTR VkResult create_device(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCreateInfo,
                                   const VkAllocationCallbacks *pAllocator, VkDevice *pDevice)
 {
@@ -431,6 +500,14 @@ wsi_layer_vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo, const VkAllo
 }
 
 VWL_VKAPI_CALL(VkResult)
+wsi_layer_vkEnumeratePhysicalDevices(VkInstance                                  instance,
+                                     uint32_t*                                   pPhysicalDeviceCount,
+                                     VkPhysicalDevice*                           pPhysicalDevices) VWL_API_POST
+{
+   return layer::enumerate_physical_devices(instance, pPhysicalDeviceCount, pPhysicalDevices);
+}
+
+VWL_VKAPI_CALL(VkResult)
 wsi_layer_vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCreateInfo,
                          const VkAllocationCallbacks *pAllocator, VkDevice *pDevice) VWL_API_POST
 {
@@ -590,6 +667,7 @@ wsi_layer_vkGetInstanceProcAddr(VkInstance instance, const char *funcName) VWL_A
 {
    GET_PROC_ADDR(vkGetDeviceProcAddr);
    GET_PROC_ADDR(vkGetInstanceProcAddr);
+   GET_PROC_ADDR(vkEnumeratePhysicalDevices);
    GET_PROC_ADDR(vkCreateInstance);
    GET_PROC_ADDR(vkDestroyInstance);
    GET_PROC_ADDR(vkCreateDevice);
