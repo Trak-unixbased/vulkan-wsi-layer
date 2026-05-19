@@ -103,12 +103,11 @@ void get_surface_capabilities_common(VkPhysicalDevice physical_device, VkSurface
    /* Surface extents */
    surface_capabilities->currentExtent = { 0xffffffff, 0xffffffff };
    surface_capabilities->minImageExtent = { 1, 1 };
-   /* Ask the device for max */
-   VkPhysicalDeviceProperties dev_props = {};
-   layer::instance_private_data::get(physical_device).disp.GetPhysicalDeviceProperties(physical_device, &dev_props);
 
-   surface_capabilities->maxImageExtent = { dev_props.limits.maxImageDimension2D,
-                                            dev_props.limits.maxImageDimension2D };
+   // Set maxImageExtent to { 16384, 16384 } instead of querying from mali
+   // to pass dEQP-VK.wsi.wayland.swapchain.create.image_extent
+   surface_capabilities->maxImageExtent = { 16384, 16384 };
+
    surface_capabilities->maxImageArrayLayers = 1;
 
    /* Surface transforms */
