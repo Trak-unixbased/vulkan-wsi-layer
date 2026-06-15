@@ -601,7 +601,9 @@ protected:
     */
    bool error_has_occured() const
    {
-      return m_error_state != VK_SUCCESS;
+      /* VK_SUBOPTIMAL_KHR is a success code, not an error. The swapchain can
+       * still acquire/present images while reporting suboptimal to the app. */
+      return m_error_state != VK_SUCCESS && m_error_state != VK_SUBOPTIMAL_KHR;
    }
 
    VkResult get_error_state() const

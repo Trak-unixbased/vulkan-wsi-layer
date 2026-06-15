@@ -518,7 +518,10 @@ VkResult swapchain_base::acquire_next_image(uint64_t timeout, VkSemaphore semaph
    };
    TRY(sync_queue_submit(m_device_data, m_queue, fence, semaphores));
 
-   return VK_SUCCESS;
+   /* The image was acquired and the semaphore/fence signalled successfully.
+    * Propagate VK_SUBOPTIMAL_KHR (a success code) so the application is told to
+    * recreate the swapchain, without us skipping the actual acquire. */
+   return get_error_state() == VK_SUBOPTIMAL_KHR ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
 }
 
 VkResult swapchain_base::get_swapchain_images(uint32_t *swapchain_image_count, VkImage *swapchain_images)
@@ -682,7 +685,9 @@ VkResult swapchain_base::queue_present(VkQueue queue, const VkPresentInfoKHR *pr
 
    TRY(notify_presentation_engine(submit_info.pending_present));
 
-   return VK_SUCCESS;
+   /* Report VK_SUBOPTIMAL_KHR (success) at present time too, so the application
+    * gets the recreate hint even if it only checks the present result. */
+   return get_error_state() == VK_SUBOPTIMAL_KHR ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
 }
 
 void swapchain_base::deprecate(VkSwapchainKHR descendant)
