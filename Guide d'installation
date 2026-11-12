@@ -1,0 +1,41 @@
+# vulkan-wsi-layer
+
+Implémentation open-source d'une couche **Vulkan Window System Integration (WSI)** pour Linux, permettant aux pilotes Vulkan (ICD) dépourvus de support natif de fenêtrage d'afficher des rendus sous **Wayland**, **X11 (XCB)** et **DRM/KMS (Headless)**.
+
+## Présentation et architecture
+
+Dans l'écosystème Vulkan, le pilote matériel (ICD) est responsable de l'exécution des commandes sur le GPU, tandis que l'interface avec le serveur d'affichage relève du **WSI**. Sur certaines architectures (notamment les GPU Arm Mali utilisant des blobs propriétaires `libmali` ou des pilotes en cours de développement), les extensions WSI sont absentes ou incomplètes.
+
+`vulkan-wsi-layer` agit comme une couche intermédiaire chargée par le *Vulkan Loader* (`libvulkan`) pour exposer les extensions suivantes :
+* `VK_KHR_surface` et `VK_KHR_swapchain`
+* `VK_KHR_wayland_surface` (intégration Wayland via `xdg-shell` et `linux-dmabuf`)
+* `VK_KHR_xcb_surface` (intégration X11 via XCB DRI3 / Present)
+* `VK_KHR_display` (rendu direct sans compositeur / mode *headless*)
+* Gestion mémoire **DMA-BUF** et synchronisation explicite (*sync file* / *timeline semaphores*)
+
+---
+
+## Pré-requis
+
+### Environnement matériel et logiciel
+* **Système d'exploitation :** Linux (x86_64 ou ARM64 / `aarch64`, ex. Debian 12+, Ubuntu 24.04 LTS / 26.04 LTS).
+* **Pilote Vulkan (ICD) :** Un pilote Vulkan fonctionnel déclaré dans `/etc/vulkan/icd.d/` ou `/usr/share/vulkan/icd.d/`.
+* **Outils de compilation :**
+  * `cmake` (version 3.16 ou supérieure)
+  * `ninja-build` ou `make`
+  * Compilateur compatible C++17 (`g++` ou `clang++`)
+  * `pkg-config` et `python3`
+
+### Dépendances de développement (Debian / Ubuntu)
+
+Installez les en-têtes Vulkan, Wayland, X11/XCB et DRM :
+
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential cmake ninja-build pkg-config python3 git \
+  libvulkan-dev vulkan-headers vulkan-tools \
+  libdrm-dev libgbm-dev \
+  libwayland-dev wayland-protocols libwayland-egl-backend-dev \
+  libxcb1-dev libxcb-dri3-dev libxcb-present-dev libxcb-sync-dev \
+  libxshmfence-dev libx11-xcb-dev
