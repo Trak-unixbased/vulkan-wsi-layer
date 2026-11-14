@@ -104,9 +104,18 @@ void get_surface_capabilities_common(VkPhysicalDevice physical_device, VkSurface
    surface_capabilities->currentExtent = { 0xffffffff, 0xffffffff };
    surface_capabilities->minImageExtent = { 1, 1 };
 
-   // Set maxImageExtent to { 16384, 16384 } instead of querying from mali
-   // to pass dEQP-VK.wsi.wayland.swapchain.create.image_extent
-   surface_capabilities->maxImageExtent = { 16384, 16384 };
+   /* The Mali driver reports a maxImageDimension2D (65536) far beyond what the display/compositor path can
+    * allocate, which makes dEQP-VK.wsi.*.swapchain.create.image_extent fail. Clamp to 16384, but never report more
+    * than the device actually supports. */
+   constexpr uint32_t max_presentable_extent = 16384;
+   VkPhysicalDeviceProperties dev_props = {};
+   layer::instance_private_data::get(physical_device).disp.GetPhysicalDeviceProperties(physical_device, &dev_props);
+   uint32_t max_extent = max_presentable_extent;
+   if (dev_props.limits.maxImageDimension2D != 0 && dev_props.limits.maxImageDimension2D < max_extent)
+   {
+      max_extent = dev_props.limits.maxImageDimension2D;
+   }
+   surface_capabilities->maxImageExtent = { max_extent, max_extent };
 
    surface_capabilities->maxImageArrayLayers = 1;
 

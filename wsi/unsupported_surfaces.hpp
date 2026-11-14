@@ -42,8 +42,15 @@ namespace wsi
 {
 /* A list of platform-specific unsupported surface extensions
    Not using the extension macros and symbols due to missing definitions for native platform symbols. */
+#if BUILD_WSI_XCB
+/* VK_KHR_xcb_surface and VK_KHR_xlib_surface are implemented by the XCB backend: listing them here disabled
+ * VK_EXT_swapchain_maintenance1 for every application that merely enabled an X11 surface extension. */
+static constexpr std::array unsupported_surfaces_ext_array = { "VK_KHR_win32_surface", "VK_EXT_metal_surface",
+                                                               "VK_KHR_android_surface" };
+#else
 static constexpr std::array unsupported_surfaces_ext_array = { "VK_KHR_win32_surface", "VK_KHR_xlib_surface",
                                                                "VK_KHR_xcb_surface", "VK_EXT_metal_surface",
                                                                "VK_KHR_android_surface" };
+#endif
 
 } // namespace wsi

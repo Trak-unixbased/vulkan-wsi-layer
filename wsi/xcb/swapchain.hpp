@@ -46,14 +46,16 @@ extern "C" {
 #include <vulkan/vk_icd.h>
 }
 
-#include <X11/Xlib-xcb.h>
-extern "C" {
-#include <X11/xshmfence.h>
-}
+#include <cstdint>
+#include <condition_variable>
+#include <mutex>
+
 #include <xcb/xcb.h>
 #include <xcb/dri3.h>
 #include <xcb/present.h>
-#include <xcb/shm.h>
+extern "C" {
+#include <X11/xshmfence.h>
+}
 
 #include "util/wsialloc/wsialloc.h"
 #include "util/custom_allocator.hpp"
@@ -69,24 +71,22 @@ struct x11_image_data
 {
    x11_image_data(const VkDevice &device, const util::allocator &allocator)
       : external_mem(device, allocator)
-      , pixmap(0)
+      , pixmap(XCB_NONE)
       , present_fence()
       , shm_fence(nullptr)
-      , sync_fence(0)
-      , serial(0)
-      , shmseg(0)
-      , shmid(-1)
+      , sync_fence(XCB_NONE)
    {
-   };
+   }
 
-   external_memory    external_mem;
-   xcb_pixmap_t       pixmap;
+   external_memory external_mem;
+   /** X pixmap wrapping the image dma-buf (DRI3). */
+   xcb_pixmap_t pixmap;
+   /** Fence signalled when the GPU has finished rendering the image. */
    sync_fd_fence_sync present_fence;
-   struct xshmfence  *shm_fence;
-   uint32_t           sync_fence;
-   uint32_t           serial;
-   xcb_shm_seg_t      shmseg;
-   int                shmid;
+   /** Shared-memory fence triggered by the X server once it no longer reads the pixmap. */
+   struct xshmfence *shm_fence;
+   /** X Sync fence object backed by @ref shm_fence. */
+   uint32_t sync_fence;
 };
 
 struct image_creation_parameters
@@ -97,10 +97,11 @@ struct image_creation_parameters
    VkExternalMemoryImageCreateInfoKHR m_external_info;
    VkImageDrmFormatModifierExplicitCreateInfoEXT m_drm_mod_info;
 
-   image_creation_parameters(wsialloc_format allocated_format,
-                             util::allocator allocator, VkExternalMemoryImageCreateInfoKHR external_info,
+   image_creation_parameters(wsialloc_format allocated_format, util::allocator allocator,
+                             VkExternalMemoryImageCreateInfoKHR external_info,
                              VkImageDrmFormatModifierExplicitCreateInfoEXT drm_mod_info)
-      : m_allocated_format(allocated_format)
+      : m_image_create_info()
+      , m_allocated_format(allocated_format)
       , m_image_layout(allocator)
       , m_external_info(external_info)
       , m_drm_mod_info(drm_mod_info)
@@ -115,9 +116,6 @@ public:
                       surface &wsi_surface);
 
    ~swapchain();
-
-   /* TODO: make the buffer destructor a friend? so this can be protected */
-   void release_buffer();
 
 protected:
    /**
@@ -165,20 +163,10 @@ protected:
    void destroy_image(swapchain_image &image) override;
 
    /**
-    * @brief Method to check if there are any free images
-    *
-    * @return true if any images are free, otherwise false.
-    */
-   bool free_image_found();
-
-   /**
     * @brief Hook for any actions to free up a buffer for acquire
     *
     * @param[in,out] timeout time to wait, in nanoseconds. 0 doesn't block,
-    *                        UINT64_MAX waits indefinitely. The timeout should
-    *                        be updated if a sleep is required - this can
-    *                        be set to 0 if the semaphore is now not expected
-    *                        block.
+    *                        UINT64_MAX waits indefinitely.
     */
    VkResult get_free_buffer(uint64_t *timeout) override;
 
@@ -187,7 +175,7 @@ protected:
     *
     * @param[in] image       The swapchain image for which to set a present payload.
     * @param     queue       A Vulkan queue that can be used for any Vulkan commands needed.
-    * @param[in] sem_payload Array of Vulkan semaphores that constitute the payload.
+    * @param[in] semaphores  Array of Vulkan semaphores that constitute the payload.
     * @param[in] submission_pnext Chain of pointers to attach to the payload submission.
     *
     * @return VK_SUCCESS on success or an error code otherwise.
@@ -197,6 +185,9 @@ protected:
 
    VkResult image_wait_present(swapchain_image &image, uint64_t timeout) override;
 
+   /**
+    * @brief Process the X Present events already received, without blocking.
+    */
    void update_pending_image_status() override;
 
    /**
@@ -214,57 +205,34 @@ protected:
 
 private:
    xcb_connection_t *m_connection;
-   xcb_window_t      m_window;
-   xcb_gc_t          m_gc;
-   xcb_screen_t     *m_screen;
-   xcb_pixmap_t      m_backing_pixmap;
-   xcb_special_event_t *m_present_event;
-   xcb_present_event_t m_event_id;
+   xcb_window_t m_window;
 
+   /** Special event queue receiving the Present events of @ref m_window, or nullptr. */
+   xcb_special_event_t *m_present_event;
+   /** Event context id used with xcb_present_select_input. */
+   uint32_t m_event_id;
+
+   /**
+    * @brief Serialises the processing of Present events.
+    *
+    * Events are consumed both by the page flip thread (FIFO pacing) and by the application thread (waiting for a
+    * free image). Everything below is protected by this mutex.
+    */
+   std::mutex m_event_mutex;
+   /** Signalled whenever Present events have been processed, wakes threads waiting on @ref m_event_mutex. */
+   std::condition_variable m_event_cv;
+   /** True while one thread is blocked in poll() on the X connection. */
+   bool m_event_poller_active;
+   /** MSC of the last completed present. */
    uint64_t m_last_present_msc;
 
-   uint32_t m_window_width;                // width of m_window
-   uint32_t m_window_height;               // height of m_window
+   uint32_t m_window_width;  // width of m_window when the swapchain was created
+   uint32_t m_window_height; // height of m_window when the swapchain was created
 
-   /**
-    * @brief Allocates a Vulkan image with the specified image create info.
-    *
-    * @param image_create_info The create info for the Vulkan image.
-    * @param image_data The x11_image_data structure to store the image data.
-    * @return VkResult The result of the image allocation operation.
-    */
-   VkResult allocate_image(VkImageCreateInfo &image_create_info,
-                           x11_image_data *image_data);
-
-   /**
-    * @brief Allocate a buffer from the WSI Allocator.
-    *
-    * This function allocates image resource, like importable formats, and allocated format.
-    *
-    * @param image_create_info The create info for the Vulkan image.
-    * @param image_data The X11 image data.
-    * @param importable_formats The list of importable formats.
-    * @param allocated_format The allocated format.
-    * @param avoid_allocation Indicates that the image should be real allocated.
-    * @return VkResult The result of the allocation.
-    */
-   VkResult allocate_wsialloc(VkImageCreateInfo &image_create_info,
-                              x11_image_data *image_data,
-                              util::vector<wsialloc_format> &importable_formats,
-                              wsialloc_format *allocated_format,
-                              bool avoid_allocation);
-
-   /**
-    * @brief Notifi xwayland to initializes an surface image.
-    *
-    * @param image_create_info The create info for the Vulkan image.
-    * @param image_data The X11 image data.
-    * @param creation_parameters The parameters for image creation.
-    * @return VkResult The result of the image initialization.
-    */
-   VkResult x11_image_init(VkImageCreateInfo         image_create_info,
-                           x11_image_data            *image_data,
-                           image_creation_parameters &creation_parameters);
+   /** XCB_PRESENT_OPTION_COPY forced through DISABLE_XCB_FLIP. Read once at creation time. */
+   bool m_force_copy;
+   /** Use XCB_PRESENT_OPTION_ASYNC for MAILBOX (only on Xwayland, where async flips do not tear). */
+   bool m_mailbox_async;
 
    /** Raw pointer to the WSI Surface that this swapchain was created from. The Vulkan specification ensures that the
     * surface is valid until swapchain is destroyed. */
@@ -280,24 +248,43 @@ private:
     */
    struct image_creation_parameters m_image_creation_parameters;
 
-   /*
-    * @brief Get the memory type which the specified file descriptor can be
-    * imported as.
-    *
-    * @param      fd      The given fd.
-    * @param[out] mem_idx The index of the supported memory type.
-    *
-    * @return VK_SUCCESS on success. On failure the error value of
-    * vkGetMemoryFdPropertiesKHR is returned.
+   /**
+    * @brief Allocates the memory of a swapchain image using the format selected at swapchain creation.
     */
-   VkResult get_fd_mem_type_index(int fd, uint32_t &mem_idx);
+   VkResult allocate_image(x11_image_data *image_data);
+
+   /**
+    * @brief Allocate a buffer from the WSI Allocator.
+    *
+    * @param image_create_info  The create info for the Vulkan image.
+    * @param image_data         The X11 image data.
+    * @param importable_formats The list of importable formats.
+    * @param allocated_format   The allocated format.
+    * @param avoid_allocation   Only select the format, do not allocate memory.
+    * @return VkResult The result of the allocation.
+    */
+   VkResult allocate_wsialloc(const VkImageCreateInfo &image_create_info, x11_image_data *image_data,
+                              util::vector<wsialloc_format> &importable_formats, wsialloc_format *allocated_format,
+                              bool avoid_allocation);
+
+   /**
+    * @brief Create the X pixmap and the X Sync fence of a swapchain image (DRI3).
+    *
+    * @param image_create_info   The create info for the Vulkan image.
+    * @param image_data          The X11 image data.
+    * @param creation_parameters The parameters for image creation.
+    * @return VkResult The result of the image initialization.
+    */
+   VkResult x11_image_init(const VkImageCreateInfo &image_create_info, x11_image_data *image_data,
+                           const image_creation_parameters &creation_parameters);
 
    /**
     * @brief Finds what formats are compatible with the requested swapchain image Vulkan Device and Xcb surface.
     *
     * @param      info               The Swapchain image creation info.
     * @param[out] importable_formats A list of formats that can be imported to the Vulkan Device.
-    * @param[out] exportable_formats A list of formats that can be exported from the Vulkan Device.
+    * @param[out] exportable_modifers A list of modifiers that can be exported from the Vulkan Device.
+    * @param[out] drm_format_props   The DRM format modifier properties of the Vulkan format.
     *
     * @return VK_SUCCESS or VK_ERROR_OUT_OF_HOST_MEMORY
     */
@@ -305,9 +292,39 @@ private:
                                            util::vector<wsialloc_format> &importable_formats,
                                            util::vector<uint64_t> &exportable_modifers,
                                            util::vector<VkDrmFormatModifierPropertiesEXT> &drm_format_props);
-   void handle_dri3_present_event(xcb_present_generic_event_t *event);
 
-   void poll_present_event_for_pending_image();
+   /**
+    * @brief Handle one Present event and free it. Must be called with @ref m_event_mutex held.
+    */
+   void handle_present_event_locked(xcb_present_generic_event_t *event);
+
+   /**
+    * @brief Process all queued Present events without blocking. Must be called with @ref m_event_mutex held.
+    *
+    * @return true if at least one event was processed.
+    */
+   bool drain_present_events_locked();
+
+   /**
+    * @brief Wait until @p done returns true, processing Present events meanwhile.
+    *
+    * @param abs_timeout Absolute CLOCK_MONOTONIC deadline in nanoseconds, UINT64_MAX for no deadline.
+    * @param done        Predicate evaluated with @ref m_event_mutex held.
+    *
+    * @return VK_SUCCESS, VK_TIMEOUT, or an error if the window or the connection is gone.
+    */
+   template <typename Predicate>
+   VkResult wait_for_present_events(uint64_t abs_timeout, Predicate done);
+
+   /**
+    * @brief Returns true if at least one image is FREE.
+    */
+   bool free_image_found();
+
+   /**
+    * @brief Return all images still owned by the X server to the FREE state (window or connection lost).
+    */
+   void release_server_owned_images();
 };
 } // namespace xcb
 } // namespace wsi

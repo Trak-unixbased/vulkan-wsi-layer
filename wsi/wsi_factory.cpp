@@ -218,18 +218,49 @@ VkResult add_device_extensions_required_by_layer(VkPhysicalDevice phys_dev,
       bool supported = available_device_extensions.contains(extensions_required_by_layer);
       if (!supported)
       {
-         /* Can we accept failure? The layer unconditionally advertises support for this platform and the loader uses
-          * this information to enable its own support of the vkCreate*SurfaceKHR entrypoints. The rest of the Vulkan
-          * stack may not support this extension so we cannot blindly fall back to it.
-          * For now treat this as an error.
-          */
-         return VK_ERROR_INITIALIZATION_FAILED;
+         /* The device (e.g. llvmpipe next to the Mali DDK) cannot be driven by the layer for this platform.
+          * Failing vkCreateDevice here made every Vulkan application (vulkaninfo, compute-only programs...) fail on
+          * such devices. Create the device without the layer's extensions instead:
+          * is_physical_device_wsi_capable() reports the device as unable to present on layer-owned surfaces, so a
+          * conformant application never creates a swapchain with it. */
+         WSI_LOG_WARNING("Physical device lacks the extensions required by the WSI layer for platform %d, "
+                         "presentation through the layer is disabled for it.",
+                         static_cast<int>(wsi_ext.platform));
+         continue;
       }
 
       TRY_LOG_CALL(extensions_to_enable.add(extensions_required_by_layer));
    }
 
    return VK_SUCCESS;
+}
+
+bool is_physical_device_wsi_capable(VkPhysicalDevice phys_dev, const util::wsi_platform_set &enabled_platforms)
+{
+   util::allocator allocator{ layer::instance_private_data::get(phys_dev).get_allocator(),
+                              VK_SYSTEM_ALLOCATION_SCOPE_COMMAND };
+   util::extension_list available_device_extensions{ allocator };
+   if (get_available_device_extensions(phys_dev, available_device_extensions) != VK_SUCCESS)
+   {
+      return false;
+   }
+
+   for (const auto &wsi_ext : supported_wsi_extensions)
+   {
+      if (!enabled_platforms.contains(wsi_ext.platform))
+      {
+         continue;
+      }
+
+      surface_properties *props = get_surface_properties(wsi_ext.platform);
+      util::extension_list extensions_required_by_layer{ allocator };
+      if (props == nullptr || props->get_required_device_extensions(extensions_required_by_layer) != VK_SUCCESS ||
+          !available_device_extensions.contains(extensions_required_by_layer))
+      {
+         return false;
+      }
+   }
+   return true;
 }
 
 VkResult add_instance_extensions_required_by_layer(const util::wsi_platform_set enabled_platforms,

@@ -35,6 +35,7 @@
 #include <vulkan/vulkan.h>
 #include <thread>
 #include <array>
+#include <atomic>
 
 #include <util/custom_allocator.hpp>
 #include <util/helpers.hpp>
@@ -314,8 +315,10 @@ protected:
 
    /**
     * @brief Whether the page flip thread has to continue running or terminate.
+    *
+    * Written by the application thread (teardown) while the page flip thread reads it: must be atomic.
     */
-   bool m_page_flip_thread_run;
+   std::atomic<bool> m_page_flip_thread_run;
 
    /**
     * @brief A semaphore to be signalled once a page flip event occurs.
@@ -559,14 +562,16 @@ protected:
       return VK_SUCCESS;
    }
 
-    /**
-    * @brief update pending image status if it is freed by the compositor
-
+   /**
+    * @brief Poll the presentation engine for images it has released.
     *
-    * Check to the compositor if the pending image is released to the drvier.
-    *
+    * Called periodically by the page flip thread and while waiting for pending buffers, so that backends whose
+    * release notifications are only processed on demand (e.g. X11 Present IdleNotify events) can return images to
+    * the FREE state. Must not block. The default implementation does nothing.
     */
-   virtual void update_pending_image_status() {};
+   virtual void update_pending_image_status()
+   {
+   }
 
    /**
     * @brief Sets the present payload for a swapchain image.
@@ -603,12 +608,13 @@ protected:
    {
       /* VK_SUBOPTIMAL_KHR is a success code, not an error. The swapchain can
        * still acquire/present images while reporting suboptimal to the app. */
-      return m_error_state != VK_SUCCESS && m_error_state != VK_SUBOPTIMAL_KHR;
+      const VkResult state = m_error_state.load(std::memory_order_acquire);
+      return state != VK_SUCCESS && state != VK_SUBOPTIMAL_KHR;
    }
 
    VkResult get_error_state() const
    {
-      return m_error_state;
+      return m_error_state.load(std::memory_order_acquire);
    }
 
    /*
@@ -617,11 +623,21 @@ protected:
     * The error state should be set when a failure that should be communicated
     * to the application occurs during the page flipping thread.
     *
+    * The state is shared between the application threads and the page flip thread, hence the atomic.
+    * VK_SUBOPTIMAL_KHR is only a hint: it is recorded only while no other state is set, so that it can never
+    * hide a real error (e.g. an X11 ConfigureNotify reporting both a destroyed window and a size change).
+    *
     * @param state Error code to be returned from acquire_next_image.
     */
    void set_error_state(VkResult state)
    {
-      m_error_state = state;
+      if (state == VK_SUBOPTIMAL_KHR)
+      {
+         VkResult expected = VK_SUCCESS;
+         m_error_state.compare_exchange_strong(expected, state, std::memory_order_acq_rel);
+         return;
+      }
+      m_error_state.store(state, std::memory_order_release);
    }
 
 private:
@@ -633,7 +649,7 @@ private:
     * appropriate error code and it is returned to the user through the next
     * acquire_next_image call.
     */
-   VkResult m_error_state;
+   std::atomic<VkResult> m_error_state;
 
    /**
     * @brief Wait for a buffer to become free.

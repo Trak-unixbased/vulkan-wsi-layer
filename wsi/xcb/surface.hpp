@@ -44,9 +44,13 @@
 
 #pragma once
 
+#include <xcb/xcb.h>
+
 #include "wsi/surface.hpp"
 #include "surface_properties.hpp"
+#include "xcb_helpers.hpp"
 
+#include "util/custom_allocator.hpp"
 #include "util/macros.hpp"
 
 namespace wsi
@@ -60,7 +64,6 @@ struct drm_format_pair
    uint64_t modifier;
 };
 
-
 class surface : public wsi::surface
 {
 public:
@@ -68,9 +71,10 @@ public:
    struct init_parameters;
 
    /** Constructor to allow for custom allocation, but require privately defined arguments. */
-   surface(const init_parameters&);
+   surface(const init_parameters &);
 
-   static util::unique_ptr<surface> make_surface(const util::allocator &allocator, xcb_connection_t* connection, xcb_window_t window);
+   static util::unique_ptr<surface> make_surface(const util::allocator &allocator, xcb_connection_t *connection,
+                                                 xcb_window_t window);
 
    /** Destructor */
    ~surface() override;
@@ -81,18 +85,14 @@ public:
 
    /**
     * @brief Get the XCB connection associated with the surface.
-    *
-    * @return The XCB connection.
     */
-   xcb_connection_t* get_xcb_connection() const
+   xcb_connection_t *get_xcb_connection() const
    {
       return connection;
    }
 
    /**
     * @brief Get the XCB window associated with the surface.
-    *
-    * @return The XCB window.
     */
    xcb_window_t get_xcb_window() const
    {
@@ -100,9 +100,7 @@ public:
    }
 
    /**
-    * @brief Get the bit depth of the surface.
-    *
-    * @return The bit depth of the surface.
+    * @brief Get the depth of the window (16, 24, 30 or 32).
     */
    uint32_t get_bit_depth() const
    {
@@ -110,9 +108,7 @@ public:
    }
 
    /**
-    * @brief Get the bits per pixel (bpp) of the surface.
-    *
-    * @return The number of bits per pixel.
+    * @brief Get the bits per pixel used for the window's pixmaps.
     */
    uint32_t get_bpp() const
    {
@@ -120,7 +116,15 @@ public:
    }
 
    /**
-    * @brief Returns a reference to a list of DRM formats supported by the XCB surface.
+    * @brief Capabilities of the X server the window lives on (DRI3 version, Present, Xwayland).
+    */
+   const connection_caps &get_connection_caps() const
+   {
+      return caps;
+   }
+
+   /**
+    * @brief Returns a reference to a list of DRM formats supported by the X server for this window.
     *
     * The reference is valid throughout the lifetime of this surface.
     */
@@ -129,51 +133,24 @@ public:
       return supported_formats;
    }
 
-   /**
-    * @brief Set the next frame callback.
-    *
-    * Make a frame request on the compositor which will be applied in the next
-    * wl_surface::commit. It overwrites previous requested frame events.
-    *
-    * @return true for success, false otherwise.
-    */
-   bool set_frame_callback();
-
-   /**
-    * @brief Wait for the compositor's last requested frame event.
-    *
-    * @return true for success, false otherwise.
-    */
-   bool wait_next_frame_event();
-
 private:
    /**
     * @brief Initialize the WSI surface
     *
     * @return true on success, false otherwise.
     */
-   bool init(const util::allocator &allocator);
+   bool init();
 
-   friend void surface_registry_handler(void *data, uint32_t name,
-                                        const char *interface, uint32_t version) VWL_API_POST;
-
-   /** A list of DRM formats supported by the compositor on this surface */
+   /** A list of DRM formats supported by the X server on this window. */
    util::vector<drm_format_pair> supported_formats;
    /** Surface properties specific to the xcb surface. */
    surface_properties properties;
 
-   /**
-    * @brief true when waiting for the server hint to present a buffer
-    *
-    * true if a buffer has been presented and we've not had a wl_surface::frame
-    * callback to indicate the server is ready for the next buffer.
-    */
-   bool present_pending;
-
    xcb_connection_t *connection;
-   xcb_window_t      window;
-   uint32_t          bit_depth;
-   uint32_t          bpp;
+   xcb_window_t window;
+   uint32_t bit_depth;
+   uint32_t bpp;
+   connection_caps caps;
 };
 
 } // namespace xcb

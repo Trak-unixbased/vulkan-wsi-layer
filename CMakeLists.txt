@@ -20,20 +20,30 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-cmake_minimum_required(VERSION 3.4.3)
-project(VkLayer_window_system_integration)
+# CMake 4.x (Ubuntu 26.04 ships 4.2) removed compatibility with projects declaring a minimum below 3.5.
+# The <min>...<max> form keeps the project buildable with both CMake 3.x and 4.x.
+cmake_minimum_required(VERSION 3.19...4.2)
+project(VkLayer_window_system_integration C CXX)
+
+include(GNUInstallDirs)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(VULKAN_PKG_CONFIG vulkan)
 
-find_program(CLANG_TIDY clang-tidy-8)
-
-if (NOT CLANG_TIDY STREQUAL "CLANG_TIDY-NOTFOUND")
-   message(STATUS "Using clang-tidy: ${CLANG_TIDY}")
-   set(CMAKE_CXX_CLANG_TIDY ${CLANG_TIDY} -checks=bugprone-*,modernize-*)
+option(ENABLE_CLANG_TIDY "Run clang-tidy while compiling" OFF)
+if(ENABLE_CLANG_TIDY)
+   find_program(CLANG_TIDY NAMES clang-tidy clang-tidy-8)
+   if(CLANG_TIDY)
+      message(STATUS "Using clang-tidy: ${CLANG_TIDY}")
+      set(CMAKE_CXX_CLANG_TIDY ${CLANG_TIDY} -checks=bugprone-*,modernize-*)
+   endif()
 endif()
 
+option(WSI_LAYER_WERROR "Treat compiler warnings as errors" OFF)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pthread -fPIC")
+if(WSI_LAYER_WERROR)
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+endif()
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -54,6 +64,12 @@ else()
    message(FATAL_ERROR "Either vulkan.pc must be available or VULKAN_CXX_INCLUDE must be defined")
 endif()
 
+# Locate vulkan_core.h to check the header version against the experimental code.
+find_file(VULKAN_CORE_HEADER vulkan/vulkan_core.h PATHS ${VULKAN_CXX_INCLUDE} NO_DEFAULT_PATH)
+if(NOT VULKAN_CORE_HEADER)
+   find_file(VULKAN_CORE_HEADER vulkan/vulkan_core.h)
+endif()
+
 # Build Configuration options
 
 # Backend support
@@ -62,9 +78,12 @@ option(BUILD_WSI_WAYLAND "Build with support for VK_KHR_wayland_surface" OFF)
 option(BUILD_WSI_DISPLAY "Build with support for VK_KHR_display" OFF)
 option(BUILD_WSI_XCB "Build with support for VK_KHR_xcb_surface" OFF)
 
-set(SELECT_EXTERNAL_ALLOCATOR "none" CACHE STRING "Select an external system allocator (none, dma_buf_heaps)")
-set(EXTERNAL_WSIALLOC_LIBRARY "" CACHE STRING "External imple-DSELECT_EXTERNAL_ALLOCATORmentation of the wsialloc interface to use")
-set(WSIALLOC_MEMORY_HEAP_NAME "linux,cma" CACHE STRING "Heap name used by the dma_buf_heaps allocator")
+set(SELECT_EXTERNAL_ALLOCATOR "none" CACHE STRING "Select an external system allocator (none, ion, dma_buf_heaps)")
+set(EXTERNAL_WSIALLOC_LIBRARY "" CACHE STRING "External implementation of the wsialloc interface to use")
+set(WSIALLOC_MEMORY_HEAP_NAME "linux,cma" CACHE STRING "Preferred heap name used by the dma_buf_heaps allocator")
+set(WSIALLOC_FALLBACK_HEAP_NAME "system" CACHE STRING
+    "Heap used by the dma_buf_heaps allocator when the preferred heap is missing or exhausted (empty to disable)")
+option(WSI_LAYER_INSTALL_IMPLICIT "Install the layer manifest as an implicit layer" ON)
 
 # Optional features
 option(BUILD_WSI_DISPLAY_SUPPORT_FORMAT_MODIFIERS "Build with support for format modifiers in VK_KHR_display" ON)
@@ -77,8 +96,16 @@ option(WAYLAND_SUPPORT_EXPLICIT_SYNC "Enable Wayland linux-explicit-synchronizat
 # VK_EXT_frame_boundary then the layer will not pass its own frame boundary events.
 option(ENABLE_INSTRUMENTATION "Pass frame boundary events by using VK_EXT_frame_boundary" OFF)
 
-if(BUILD_WSI_WAYLAND)
-   set(BUILD_WSI_XCB true)
+# The experimental code declares its own provisional VK_EXT_present_timing API. Since Vulkan 1.4.33x the extension is
+# part of the official headers with a different API (spec version 3), so both cannot coexist (Ubuntu 26.04 ships
+# 1.4.341). Fail early with a clear message instead of a wall of redefinition errors.
+if(VULKAN_WSI_LAYER_EXPERIMENTAL AND VULKAN_CORE_HEADER)
+   file(STRINGS "${VULKAN_CORE_HEADER}" VULKAN_HAS_PRESENT_TIMING REGEX "^#define VK_EXT_present_timing 1")
+   if(VULKAN_HAS_PRESENT_TIMING)
+      message(FATAL_ERROR "VULKAN_WSI_LAYER_EXPERIMENTAL requires Vulkan headers without the official "
+                          "VK_EXT_present_timing extension (${VULKAN_CORE_HEADER} defines it). "
+                          "Build with -DVULKAN_WSI_LAYER_EXPERIMENTAL=OFF.")
+   endif()
 endif()
 
 if(BUILD_WSI_WAYLAND OR BUILD_WSI_DISPLAY)
@@ -125,12 +152,15 @@ if(NOT SELECT_EXTERNAL_ALLOCATOR STREQUAL "none" AND EXTERNAL_WSIALLOC_LIBRARY S
    elseif(SELECT_EXTERNAL_ALLOCATOR STREQUAL "dma_buf_heaps")
       target_sources(wsialloc PRIVATE util/wsialloc/wsialloc_dma_buf_heaps.c util/wsialloc/wsialloc_helpers.c)
       target_link_libraries(wsialloc drm_utils)
+      # linux/dma-heap.h is part of the kernel UAPI (linux-libc-dev), so KERNEL_HEADER_DIR is optional here.
       if(DEFINED KERNEL_HEADER_DIR)
          target_include_directories(wsialloc PRIVATE "${KERNEL_HEADER_DIR}")
-      else()
-         message(FATAL_ERROR "KERNEL_HEADER_DIR must be defined as the directory that includes the kernel headers.")
       endif()
-      add_definitions(-Ulinux -DWSIALLOC_MEMORY_HEAP_NAME=${WSIALLOC_MEMORY_HEAP_NAME})
+      # Heap names are passed as string literals, which avoids the former "-Ulinux" hack that was needed
+      # to stop the preprocessor from expanding the "linux" token of "linux,cma".
+      target_compile_definitions(wsialloc PRIVATE
+         "WSIALLOC_MEMORY_HEAP_NAME=\"${WSIALLOC_MEMORY_HEAP_NAME}\""
+         "WSIALLOC_FALLBACK_HEAP_NAME=\"${WSIALLOC_FALLBACK_HEAP_NAME}\"")
    else()
       message(FATAL_ERROR "Invalid external allocator selected: ${SELECT_EXTERNAL_ALLOCATOR}")
    endif()
@@ -225,7 +255,7 @@ if(BUILD_WSI_WAYLAND)
       target_compile_definitions(wayland_wsi PRIVATE "-DSUPPORT_EXPLICIT_SYNC=0")
    endif()
 else()
-   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_KHR_wayland_surface/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+   list(APPEND WSI_MANIFEST_REMOVED_EXTENSIONS VK_KHR_wayland_surface)
 endif()
 
 # Headless
@@ -243,14 +273,12 @@ if(BUILD_WSI_HEADLESS)
       ${PROJECT_SOURCE_DIR}
       ${VULKAN_CXX_INCLUDE}
       ${THIRDPARTY_INCLUDE}
-      ${CMAKE_CURRENT_BINARY_DIR}
-      ${XCB_INCLUDE_DIRS})
+      ${CMAKE_CURRENT_BINARY_DIR})
 
    target_compile_options(wsi_headless INTERFACE "-DBUILD_WSI_HEADLESS=1")
    list(APPEND LINK_WSI_LIBS wsi_headless)
 else()
-   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_EXT_headless_surface/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
-   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_KHR_shared_presentable_image/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+   list(APPEND WSI_MANIFEST_REMOVED_EXTENSIONS VK_EXT_headless_surface VK_KHR_shared_presentable_image)
 endif()
 
 # Display
@@ -283,7 +311,7 @@ if (BUILD_WSI_DISPLAY)
    endif()
    list(APPEND LINK_WSI_LIBS wsi_display)
 else()
-   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_KHR_display/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+   list(APPEND WSI_MANIFEST_REMOVED_EXTENSIONS VK_KHR_display)
 endif()
 
 # Xcb
@@ -316,12 +344,12 @@ if(BUILD_WSI_XCB)
    message(STATUS "Using xshmfence ldflags: ${XSHMFENCE_LDFLAGS}")
 
    pkg_check_modules(XCB_SYNC REQUIRED xcb-sync)
-   message(STATUS "Using xcb-sync include directories: ${XCB_INCLUDE_DIRS}")
+   message(STATUS "Using xcb-sync include directories: ${XCB_SYNC_INCLUDE_DIRS}")
    message(STATUS "Using xcb-sync cflags: ${XCB_SYNC_CFLAGS}")
    message(STATUS "Using xcb-sync ldflags: ${XCB_SYNC_LDFLAGS}")
 
    pkg_check_modules(X11_XCB REQUIRED x11-xcb)
-   message(STATUS "Using x11-xcb include directories: ${X11_INCLUDE_DIRS}")
+   message(STATUS "Using x11-xcb include directories: ${X11_XCB_INCLUDE_DIRS}")
    message(STATUS "Using x11-xcb cflags: ${X11_XCB_CFLAGS}")
    message(STATUS "Using x11-xcb ldflags: ${X11_XCB_LDFLAGS}")
 
@@ -343,7 +371,8 @@ if(BUILD_WSI_XCB)
 
    list(APPEND LINK_WSI_LIBS xcb_wsi)
 else()
-   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_EXT_xcb_surface/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+   # The manifest advertises both VK_KHR_xcb_surface and VK_KHR_xlib_surface: strip both when XCB is disabled.
+   list(APPEND WSI_MANIFEST_REMOVED_EXTENSIONS VK_KHR_xcb_surface VK_KHR_xlib_surface)
 endif()
 
 # Layer
@@ -374,7 +403,7 @@ if (VULKAN_WSI_LAYER_EXPERIMENTAL)
    target_sources(${PROJECT_NAME} PUBLIC ${PROJECT_SOURCE_DIR}/wsi/extensions/present_timing.cpp)
    add_definitions("-DVULKAN_WSI_LAYER_EXPERIMENTAL=1")
 else()
-   list(APPEND JSON_COMMANDS COMMAND sed -Ei '/VK_EXT_present_timing|VK_KHR_present_wait/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+   list(APPEND WSI_MANIFEST_REMOVED_EXTENSIONS VK_EXT_present_timing VK_KHR_present_wait)
    add_definitions("-DVULKAN_WSI_LAYER_EXPERIMENTAL=0")
 endif()
 
@@ -396,6 +425,39 @@ endif()
 
 target_link_libraries(${PROJECT_NAME} ${LINK_WSI_LIBS})
 
-add_custom_target(manifest_json ALL COMMAND
-   cp ${PROJECT_SOURCE_DIR}/layer/VkLayer_window_system_integration.json ${CMAKE_CURRENT_BINARY_DIR}
-   ${JSON_COMMANDS})
+set(WSI_LAYER_LIBRARY_FILE "${CMAKE_SHARED_LIBRARY_PREFIX}${PROJECT_NAME}${CMAKE_SHARED_LIBRARY_SUFFIX}")
+set(WSI_LAYER_MANIFEST_TEMPLATE "${PROJECT_SOURCE_DIR}/layer/VkLayer_window_system_integration.json")
+set(WSI_LAYER_MANIFEST_SCRIPT "${PROJECT_SOURCE_DIR}/layer/generate_manifest.cmake")
+set(WSI_LAYER_BUILD_MANIFEST "${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json")
+set(WSI_LAYER_INSTALL_MANIFEST "${CMAKE_CURRENT_BINARY_DIR}/install/VkLayer_window_system_integration.json")
+string(REPLACE ";" "|" WSI_MANIFEST_REMOVED_EXTENSIONS_ARG "${WSI_MANIFEST_REMOVED_EXTENSIONS}")
+
+# library_path written in the installed manifest. The default absolute path always works; distribution packages
+# may use the bare file name (resolved by the dynamic loader search path), which keeps the manifest identical across
+# architectures (required for Multi-Arch: same).
+set(WSI_LAYER_MANIFEST_LIBRARY_PATH "${CMAKE_INSTALL_FULL_LIBDIR}/${WSI_LAYER_LIBRARY_FILE}" CACHE STRING
+    "library_path of the installed layer manifest")
+
+# The build-tree manifest keeps the relative "./lib..." path so that VK_LAYER_PATH=<build dir> works.
+# The installed manifest needs an absolute path: a relative path is resolved against the manifest directory
+# (/usr/share/vulkan/...), not against the library directory.
+add_custom_command(
+   OUTPUT ${WSI_LAYER_BUILD_MANIFEST} ${WSI_LAYER_INSTALL_MANIFEST}
+   COMMAND ${CMAKE_COMMAND} -DINPUT=${WSI_LAYER_MANIFEST_TEMPLATE} -DOUTPUT=${WSI_LAYER_BUILD_MANIFEST}
+           -DREMOVE_EXTENSIONS=${WSI_MANIFEST_REMOVED_EXTENSIONS_ARG} -P ${WSI_LAYER_MANIFEST_SCRIPT}
+   COMMAND ${CMAKE_COMMAND} -DINPUT=${WSI_LAYER_MANIFEST_TEMPLATE} -DOUTPUT=${WSI_LAYER_INSTALL_MANIFEST}
+           -DREMOVE_EXTENSIONS=${WSI_MANIFEST_REMOVED_EXTENSIONS_ARG}
+           -DLIBRARY_PATH=${WSI_LAYER_MANIFEST_LIBRARY_PATH} -P ${WSI_LAYER_MANIFEST_SCRIPT}
+   DEPENDS ${WSI_LAYER_MANIFEST_TEMPLATE} ${WSI_LAYER_MANIFEST_SCRIPT}
+   COMMENT "Generating Vulkan layer manifests"
+   VERBATIM)
+add_custom_target(manifest_json ALL DEPENDS ${WSI_LAYER_BUILD_MANIFEST} ${WSI_LAYER_INSTALL_MANIFEST})
+
+# Installation
+install(TARGETS ${PROJECT_NAME} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+if(WSI_LAYER_INSTALL_IMPLICIT)
+   set(WSI_LAYER_MANIFEST_DIR "${CMAKE_INSTALL_DATADIR}/vulkan/implicit_layer.d")
+else()
+   set(WSI_LAYER_MANIFEST_DIR "${CMAKE_INSTALL_DATADIR}/vulkan/explicit_layer.d")
+endif()
+install(FILES ${WSI_LAYER_INSTALL_MANIFEST} DESTINATION ${WSI_LAYER_MANIFEST_DIR})

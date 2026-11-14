@@ -155,7 +155,9 @@ wsi_layer_vkGetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice physicalDevice, 
    auto &instance = layer::instance_private_data::get(physicalDevice);
    if (instance.should_layer_handle_surface(physicalDevice, surface))
    {
-      *pSupported = VK_TRUE;
+      /* Only devices exposing the extensions required by the layer can present on its surfaces. */
+      *pSupported =
+         wsi::is_physical_device_wsi_capable(physicalDevice, instance.get_enabled_platforms()) ? VK_TRUE : VK_FALSE;
       return VK_SUCCESS;
    }
 

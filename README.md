@@ -167,6 +167,45 @@ Copy the shared library `libVkLayer_window_system_integration.so` and JSON
 configuration `VkLayer_window_system_integration.json` into a Vulkan®
 [implicit layer directory](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderLayerInterface.md#linux-layer-discovery).
 
+`cmake --install` does this automatically: the library goes to
+`${CMAKE_INSTALL_LIBDIR}` and the manifest (with an absolute `library_path`,
+configurable through `WSI_LAYER_MANIFEST_LIBRARY_PATH`) to
+`share/vulkan/implicit_layer.d` (`share/vulkan/explicit_layer.d` with
+`-DWSI_LAYER_INSTALL_IMPLICIT=OFF`).
+
+### Debian/Ubuntu package (Orange Pi 6 Plus, CIX CD8180)
+
+`packaging/build-deb.sh` builds a `.deb` for the native architecture with the
+headless, Wayland and XCB/Xlib backends and the `dma_buf_heaps` allocator.
+On Ubuntu 26.04 arm64:
+
+```
+packaging/build-deb.sh --install-deps
+sudo apt install ./dist/vulkan-wsi-layer_*_arm64.deb
+```
+
+Run `packaging/build-deb.sh --help` for the available options.
+
+### Run-time environment variables
+
+* `DISABLE_WSI_LAYER=1`: disable the layer (loader standard).
+* `WSI_LAYER_DEVICE_FILTER`: physical devices exposed by the layer. By default
+  only the Arm proprietary (Mali DDK) driver is exposed, because other drivers
+  (llvmpipe, PanVK...) either ship their own WSI or lack the extensions the
+  layer needs. `all` disables the filter, any other value exposes the devices
+  whose name contains it. If nothing matches, every device is exposed.
+* `WSIALLOC_DMA_HEAP`: DMA-BUF heap used for swapchain images (default: the
+  build-time `WSIALLOC_MEMORY_HEAP_NAME`, then `default_cma_region`,
+  `linux,cma`, `reserved`).
+* `WSIALLOC_FALLBACK_DMA_HEAP`: heap used when the preferred one is missing or
+  exhausted (default `system`, empty to disable).
+* `XCB_SWAPCHAIN_MIN_IMAGE_COUNT`: minimum swapchain image count reported for
+  X11 surfaces (default 4, clamped to the supported range).
+* `WSI_XCB_MAILBOX_ASYNC=0|1`: force the use of `XCB_PRESENT_OPTION_ASYNC` for
+  MAILBOX on X11 (default: enabled on Xwayland only, where it does not tear).
+* `DISABLE_XCB_FLIP`: force copies instead of page flips on X11.
+* `DISABLE_XCB_PRESENT_THREAD`: present from the application thread on X11.
+
 ## Contributing
 
 We are open for contributions.

@@ -42,16 +42,9 @@
 #define VK_USE_PLATFORM_XCB_KHR 1
 #define VK_USE_PLATFORM_XLIB_KHR 1
 
-#include <X11/Xlib-xcb.h>
 #include <X11/Xlib.h>
+#include <X11/Xlib-xcb.h>
 #include <xcb/xcb.h>
-#include <xcb/dri3.h>
-#include <xcb/present.h>
-#include <xcb/shm.h>
-
-extern "C" {
-#include <X11/xshmfence.h>
-}
 
 #include "xcb_helpers.hpp"
 
@@ -61,15 +54,15 @@ extern "C" {
 #include <array>
 #include <cstring>
 #include "surface_properties.hpp"
+#include "wsi/wsi_factory.hpp"
 #include "surface.hpp"
 #include "layer/private_data.hpp"
 
+#include "wsi/synchronization.hpp"
 #include "util/drm/drm_utils.hpp"
 #include "util/log.hpp"
 #include "util/macros.hpp"
 #include "util/helpers.hpp"
-
-#define NELEMS(x) (sizeof(x) / sizeof(x[0]))
 
 namespace wsi
 {
@@ -110,51 +103,59 @@ surface_properties &surface_properties::get_instance()
 VkResult surface_properties::get_surface_capabilities(VkPhysicalDevice physical_device,
                                                       VkSurfaceCapabilitiesKHR *pSurfaceCapabilities)
 {
-   xcb_connection_t          * conn       = specific_surface->get_xcb_connection();
-   xcb_window_t              window       = specific_surface->get_xcb_window();
-   xcb_get_geometry_cookie_t geom_cookie  = {};
-   unsigned                  visual_depth = 0;
+   assert(specific_surface);
+   xcb_connection_t *conn = specific_surface->get_xcb_connection();
+   const xcb_window_t window = specific_surface->get_xcb_window();
 
    /* Image count limits */
    get_surface_capabilities_common(physical_device, pSurfaceCapabilities);
-   // 4 images have a better performance in mailbox mode.
-   pSurfaceCapabilities->minImageCount = 4;
 
-   const char* env_var = getenv("XCB_SWAPCHAIN_MIN_IMAGE_COUNT");
-   if(env_var)
+   /* 4 images give the best results in mailbox mode on the CIX platform. XCB_SWAPCHAIN_MIN_IMAGE_COUNT overrides
+    * it, clamped to [1, maxImageCount] (a value of 0 or above maxImageCount is invalid per the specification). */
+   uint32_t min_image_count = 4;
+   const char *env_var = getenv("XCB_SWAPCHAIN_MIN_IMAGE_COUNT");
+   if (env_var != nullptr)
    {
-      long min_image_count = strtol(env_var, nullptr, 0);
-      if (min_image_count >= 0)
+      char *end = nullptr;
+      const long value = strtol(env_var, &end, 0);
+      if (end != env_var && value > 0)
       {
-         pSurfaceCapabilities->minImageCount = min_image_count;
+         min_image_count = static_cast<uint32_t>(std::min<long>(value, pSurfaceCapabilities->maxImageCount));
+      }
+      else
+      {
+         WSI_LOG_WARNING("Ignoring invalid XCB_SWAPCHAIN_MIN_IMAGE_COUNT=\"%s\".", env_var);
       }
    }
+   pSurfaceCapabilities->minImageCount = std::min(min_image_count, pSurfaceCapabilities->maxImageCount);
 
-   geom_cookie = xcb_get_geometry(conn, window);
+   /* Issue the geometry request first so that it overlaps with the visual lookup round trips. */
+   const xcb_get_geometry_cookie_t geom_cookie = xcb_get_geometry(conn, window);
 
-   xcb_visualtype_t *visual =
-      get_visualtype_for_window(conn, window, &visual_depth);
+   unsigned visual_depth = 0;
+   const xcb_visualtype_t *visual = get_visualtype_for_window(conn, window, &visual_depth);
 
-   if (!visual)
+   xcb_get_geometry_reply_t *geometry = xcb_get_geometry_reply(conn, geom_cookie, nullptr);
+   if (visual == nullptr || geometry == nullptr)
+   {
+      /* Always collect the reply, otherwise it stays queued in XCB forever. */
+      free(geometry);
       return VK_ERROR_SURFACE_LOST_KHR;
+   }
 
-   xcb_get_geometry_reply_t *geometry =
-      xcb_get_geometry_reply(conn, geom_cookie, NULL);
-
-   if (geometry == NULL)
-      return VK_ERROR_SURFACE_LOST_KHR;
- 
    pSurfaceCapabilities->currentExtent.width = geometry->width;
    pSurfaceCapabilities->currentExtent.height = geometry->height;
-
    free(geometry);
 
-   if (visual_has_alpha(visual, visual_depth)) {
-      pSurfaceCapabilities->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR |
-                                                      VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
-   } else {
-      pSurfaceCapabilities->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR |
-                                                      VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+   if (visual_has_alpha(visual, visual_depth))
+   {
+      pSurfaceCapabilities->supportedCompositeAlpha =
+         VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR | VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+   }
+   else
+   {
+      pSurfaceCapabilities->supportedCompositeAlpha =
+         VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR | VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
    }
 
    return VK_SUCCESS;
@@ -316,6 +317,8 @@ VkResult surface_properties::get_surface_formats(VkPhysicalDevice physical_devic
 VkResult surface_properties::get_surface_present_modes(VkPhysicalDevice physical_device, VkSurfaceKHR surface,
                                                        uint32_t *pPresentModeCount, VkPresentModeKHR *pPresentModes)
 {
+   UNUSED(physical_device);
+   UNUSED(surface);
    return get_surface_present_modes_common(pPresentModeCount, pPresentModes, m_supported_modes);
 }
 
@@ -350,44 +353,45 @@ VkResult surface_properties::get_required_instance_extensions(util::extension_li
    return extension_list.add(required_instance_extensions.data(), required_instance_extensions.size());
 }
 
-struct required_properties
-{
-   bool dmabuf;
-   bool explicit_sync;
-};
-
-
 VWL_VKAPI_CALL(VkBool32)
-GetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physical_device,
-                                           uint32_t queue_index,
-                                           xcb_connection_t *connection,
-                                           xcb_visualid_t visual_id)
+GetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physical_device, uint32_t queue_index,
+                                           xcb_connection_t *connection, xcb_visualid_t visual_id) VWL_API_POST
 {
-   bool dev_supports_sync =
-      sync_fd_fence_sync::is_supported(layer::instance_private_data::get(physical_device), physical_device);
+   UNUSED(queue_index);
+
+   auto &instance_data = layer::instance_private_data::get(physical_device);
+   const bool dev_supports_sync = sync_fd_fence_sync::is_supported(instance_data, physical_device);
    if (!dev_supports_sync)
    {
       return VK_FALSE;
    }
-   struct connection_caps caps = {0};
 
-   connection_get_caps(connection, &caps);
+   if (!wsi::is_physical_device_wsi_capable(physical_device, instance_data.get_enabled_platforms()))
+   {
+      return VK_FALSE;
+   }
 
-   if (caps.has_dri3 == false)
+   connection_caps caps;
+   if (!connection_get_caps(connection, &caps))
+   {
+      return VK_FALSE;
+   }
+
+   if (!caps.has_dri3)
    {
       WSI_LOG_ERROR("vulkan: No DRI3 support detected - required for presentation\n"
                     "Note: you can probably enable DRI3 in your Xorg config\n");
       return VK_FALSE;
    }
 
-   if (caps.has_present == false)
+   if (!caps.has_present)
    {
       WSI_LOG_ERROR("vulkan: No Present support detected - required for presentation\n"
                     "Note: you can probably enable Present in your Xorg config\n");
       return VK_FALSE;
    }
 
-   if ((!visual_supported(connection_get_visualtype(connection, visual_id))))
+   if (!visual_supported(connection_get_visualtype(connection, visual_id)))
    {
       return VK_FALSE;
    }
@@ -396,15 +400,11 @@ GetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physical_device,
 }
 
 VWL_VKAPI_CALL(VkBool32)
-GetPhysicalDeviceXlibPresentationSupportKHR(VkPhysicalDevice physical_device,
-                                           uint32_t queue_index,
-                                           Display *dpy,
-                                           VisualID visualID)
+GetPhysicalDeviceXlibPresentationSupportKHR(VkPhysicalDevice physical_device, uint32_t queue_index, Display *dpy,
+                                            VisualID visualID) VWL_API_POST
 {
-   return GetPhysicalDeviceXcbPresentationSupportKHR(physical_device,
-                                                     queue_index,
-                                                     XGetXCBConnection(dpy),
-                                                     visualID);
+   return GetPhysicalDeviceXcbPresentationSupportKHR(physical_device, queue_index, XGetXCBConnection(dpy),
+                                                     static_cast<xcb_visualid_t>(visualID));
 }
 
 VWL_VKAPI_CALL(VkResult)

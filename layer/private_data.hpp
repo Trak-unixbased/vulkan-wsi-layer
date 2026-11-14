@@ -221,7 +221,7 @@ static constexpr uint32_t API_VERSION_MAX = UINT32_MAX;
    /* Vulkan 1.0 */                                                                                                       \
    EP(GetInstanceProcAddr, "", VK_API_VERSION_1_0, true, )                                                                \
    EP(DestroyInstance, "", VK_API_VERSION_1_0, true, )                                                                    \
-   EP(EnumeratePhysicalDevices, "", VK_API_VERSION_1_0, true, )                                                             \
+   EP(EnumeratePhysicalDevices, "", VK_API_VERSION_1_0, true, )                                                           \
    EP(GetPhysicalDeviceProperties, "", VK_API_VERSION_1_0, true, )                                                        \
    EP(GetPhysicalDeviceImageFormatProperties, "", VK_API_VERSION_1_0, true, )                                             \
    EP(EnumerateDeviceExtensionProperties, "", VK_API_VERSION_1_0, true, )                                                 \
@@ -236,11 +236,11 @@ static constexpr uint32_t API_VERSION_MAX = UINT32_MAX;
    /* VK_KHR_wayland_surface */                                                                                           \
    EP(CreateWaylandSurfaceKHR, VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )                           \
    /* VK_KHR_xcb_surface */                                                                                               \
-   EP(CreateXcbSurfaceKHR, VK_KHR_XCB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )                                     \
-   EP(GetPhysicalDeviceXcbPresentationSupportKHR, VK_KHR_XCB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )              \
+   EP(CreateXcbSurfaceKHR, VK_KHR_XCB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )                                   \
+   EP(GetPhysicalDeviceXcbPresentationSupportKHR, VK_KHR_XCB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )            \
    /* VK_KHR_xlib_surface */                                                                                              \
-   EP(CreateXlibSurfaceKHR, VK_KHR_XLIB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )                                   \
-   EP(GetPhysicalDeviceXlibPresentationSupportKHR, VK_KHR_XLIB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )            \
+   EP(CreateXlibSurfaceKHR, VK_KHR_XLIB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )                                 \
+   EP(GetPhysicalDeviceXlibPresentationSupportKHR, VK_KHR_XLIB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )          \
    /* VK_KHR_display */                                                                                                   \
    EP(CreateDisplayPlaneSurfaceKHR, VK_KHR_DISPLAY_EXTENSION_NAME, API_VERSION_MAX, false, )                              \
    /* VK_KHR_get_surface_capabilities2 */                                                                                 \
@@ -263,6 +263,9 @@ static constexpr uint32_t API_VERSION_MAX = UINT32_MAX;
       VK_API_VERSION_1_1, false, GetPhysicalDeviceMemoryProperties2)                                                      \
    EP(GetPhysicalDeviceSparseImageFormatProperties2KHR, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,           \
       VK_API_VERSION_1_1, false, GetPhysicalDeviceSparseImageFormatProperties2)                                           \
+   /* VK_KHR_device_group_creation or 1.1 (without KHR suffix). Filtered together with vkEnumeratePhysicalDevices. */     \
+   EP(EnumeratePhysicalDeviceGroupsKHR, VK_KHR_DEVICE_GROUP_CREATION_EXTENSION_NAME, VK_API_VERSION_1_1, false,           \
+      EnumeratePhysicalDeviceGroups)                                                                                      \
    /* VK_KHR_device_group + VK_KHR_surface or */                                                                          \
    /* 1.1 with VK_KHR_swapchain */                                                                                        \
    EP(GetPhysicalDevicePresentRectanglesKHR, VK_KHR_DEVICE_GROUP_EXTENSION_NAME, VK_API_VERSION_1_1, false, )             \

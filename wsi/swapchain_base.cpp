@@ -58,12 +58,11 @@ void swapchain_base::page_flip_thread()
    auto &sc_images = m_swapchain_images;
    VkResult vk_res = VK_SUCCESS;
    uint64_t timeout = UINT64_MAX;
+   /* Short enough for update_pending_image_status() to keep backends that poll for released images responsive. */
+   constexpr uint64_t SEMAPHORE_TIMEOUT = 100000000; /* 100 ms. */
 
-   /* No mutex is needed for the accesses to m_page_flip_thread_run variable as after the variable is
-    * initialized it is only ever changed to false. The while loop will make the thread read the
-    * value repeatedly, and the combination of semaphores and thread joins will force any changes to
-    * the variable to be visible to this thread.
-    */
+   /* m_page_flip_thread_run is atomic: it is cleared by teardown() on the application thread while this thread
+    * keeps reading it. A plain bool was a data race (undefined behaviour, reported by ThreadSanitizer). */
    while (m_page_flip_thread_run)
    {
       pending_present_request submit_info{};
@@ -75,7 +74,7 @@ void swapchain_base::page_flip_thread()
          {
             vk_res = VK_SUCCESS;
          }
-         else if ((vk_res = m_page_flip_semaphore.wait(100000000)) == VK_TIMEOUT)
+         else if ((vk_res = m_page_flip_semaphore.wait(SEMAPHORE_TIMEOUT)) == VK_TIMEOUT)
          {
             /* Image is not ready yet. */
             continue;
@@ -90,7 +89,7 @@ void swapchain_base::page_flip_thread()
       {
          /* Waiting for the page_flip_semaphore which will be signalled once there is an
           * image to display.*/
-         if ((vk_res = m_page_flip_semaphore.wait(100000000)) == VK_TIMEOUT)
+         if ((vk_res = m_page_flip_semaphore.wait(SEMAPHORE_TIMEOUT)) == VK_TIMEOUT)
          {
             /* Image is not ready yet. */
             update_pending_image_status();
@@ -692,6 +691,8 @@ VkResult swapchain_base::queue_present(VkQueue queue, const VkPresentInfoKHR *pr
 
 void swapchain_base::deprecate(VkSwapchainKHR descendant)
 {
+   /* The page flip thread of this (old) swapchain may still be updating image states. */
+   std::unique_lock<std::recursive_mutex> image_status_lock(m_image_status_mutex);
    for (auto &img : m_swapchain_images)
    {
       if (img.status == swapchain_image::FREE)
@@ -730,13 +731,35 @@ void swapchain_base::wait_for_pending_buffers()
    wait = static_cast<int>(m_swapchain_images.size()) - acquired_images - invalid_image - 1;
    image_status_lock.unlock();
 
+   /* Poll every 100 ms so that backends which only learn about released images on demand (X11 Present) get a
+    * chance to process their events. Give up after WAIT_PENDING_MAX_POLLS consecutive timeouts or on error: a
+    * compositor that never releases a buffer (window destroyed, compositor crash) must not hang vkDestroySwapchainKHR
+    * forever. Destroying the images afterwards is safe as the window system holds its own reference to the dma-buf. */
+   constexpr uint64_t WAIT_PENDING_POLL_NS = 100000000; /* 100 ms */
+   constexpr uint32_t WAIT_PENDING_MAX_POLLS = 20;      /* 2 s */
+   uint32_t consecutive_timeouts = 0;
    while (wait > 0)
    {
       /* Take down one free image semaphore. */
-      // Check every 0.1ms to see if compositor free the pending images.
-      if (wait_for_free_buffer(100000000) == VK_SUCCESS)
+      const VkResult res = wait_for_free_buffer(WAIT_PENDING_POLL_NS);
+      if (res == VK_SUCCESS)
       {
          --wait;
+         consecutive_timeouts = 0;
+         continue;
+      }
+
+      if (res != VK_TIMEOUT && res != VK_NOT_READY)
+      {
+         WSI_LOG_WARNING("Stopped waiting for pending buffers (error %d).", static_cast<int>(res));
+         break;
+      }
+
+      update_pending_image_status();
+      if (error_has_occured() || ++consecutive_timeouts >= WAIT_PENDING_MAX_POLLS)
+      {
+         WSI_LOG_WARNING("Presentation engine did not release %d pending buffer(s), continuing.", wait);
+         break;
       }
    }
 }

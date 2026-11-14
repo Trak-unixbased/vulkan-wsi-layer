@@ -25,7 +25,10 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <iterator>
 
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan.h>
@@ -205,73 +208,272 @@ VKAPI_ATTR VkResult create_instance(const VkInstanceCreateInfo *pCreateInfo, con
    return VK_SUCCESS;
 }
 
-VKAPI_ATTR VkResult enumerate_physical_devices(VkInstance                                  instance,
-                                               uint32_t*                                   pPhysicalDeviceCount,
-                                               VkPhysicalDevice*                           pPhysicalDevices)
+/* Physical device filtering.
+ *
+ * The CIX/Mali DDK relies on this layer for window system integration. Other Vulkan drivers that may be installed
+ * next to it (lavapipe, Mesa PanVK, ...) either ship their own WSI or lack the external memory extensions the layer
+ * requires, and letting the layer wrap them crashed tools such as vulkaninfo. Only the Arm proprietary driver is
+ * therefore exposed by default.
+ *
+ * The behaviour can be changed with the WSI_LAYER_DEVICE_FILTER environment variable:
+ *   unset          Expose Arm proprietary (Mali) devices only (default).
+ *   "all" / "*"    Disable filtering.
+ *   any other text Expose the devices whose deviceName contains this text.
+ *
+ * If no device matches, every device is exposed rather than leaving the application without any GPU.
+ * vkEnumeratePhysicalDevices and vkEnumeratePhysicalDeviceGroups always expose the same set of devices.
+ */
+static constexpr uint32_t ARM_VENDOR_ID = 0x13b5;
+
+static bool is_physical_device_exposed(const instance_private_data &inst_data, VkPhysicalDevice physical_device)
 {
-   if (instance == VK_NULL_HANDLE)
-   {
-      return VK_ERROR_INITIALIZATION_FAILED;
-   }
+   VkPhysicalDeviceProperties props = {};
+   inst_data.disp.GetPhysicalDeviceProperties(physical_device, &props);
 
-   auto &inst_data = layer::instance_private_data::get(instance);
-   auto alloc = inst_data.get_allocator();
-   auto fn_enumerate_physical_devices = inst_data.disp.get_fn<PFN_vkEnumeratePhysicalDevices>("vkEnumeratePhysicalDevices");
-
-   // Get physical device count
-   uint32_t layer_physical_device_count = 0;
-   assert(fn_enumerate_physical_devices.has_value());
-   TRY_LOG((*fn_enumerate_physical_devices)(instance, &layer_physical_device_count, NULL), "Failed to get physical device count");
-   if (layer_physical_device_count == 0)
+   const char *filter = std::getenv("WSI_LAYER_DEVICE_FILTER");
+   if (filter != nullptr && filter[0] != '\0')
    {
-      return VK_INCOMPLETE;
-   }
-
-   // Enumerate physical devices
-   VkPhysicalDevice *layer_physical_devices = alloc.create<VkPhysicalDevice>(layer_physical_device_count);
-   if (layer_physical_devices == NULL)
-   {
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   }
-   TRY_LOG((*fn_enumerate_physical_devices)(instance, &layer_physical_device_count, layer_physical_devices), "Failed to enumerate physical devices");
-
-   VkPhysicalDeviceProperties* layer_phyical_device_properties = alloc.create<VkPhysicalDeviceProperties>(layer_physical_device_count);
-   if (layer_phyical_device_properties == NULL)
-   {
-      alloc.destroy<VkPhysicalDevice>(layer_physical_device_count, layer_physical_devices);
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   }
-
-   uint32_t return_physcial_device_count = 0;
-   for (uint32_t i = 0; i < layer_physical_device_count; ++i)
-   {
-      // Get the physical device properties
-      layer::instance_private_data::get(layer_physical_devices[i]).disp.GetPhysicalDeviceProperties(layer_physical_devices[i], &layer_phyical_device_properties[i]);
-      // Add only Mali-G720-Immortalis device to the list of returned physical devices
-      if (layer_phyical_device_properties[i].vendorID == 0x13b5 &&
-         strcmp(layer_phyical_device_properties[i].deviceName,"Mali-G720-Immortalis") == 0)
+      if (std::strcmp(filter, "all") == 0 || std::strcmp(filter, "*") == 0)
       {
-         if (pPhysicalDevices != NULL)
+         return true;
+      }
+      return std::strstr(props.deviceName, filter) != nullptr;
+   }
+
+   if (props.vendorID != ARM_VENDOR_ID)
+   {
+      return false;
+   }
+
+   /* Prefer the driver ID: it tells the Arm DDK apart from Mesa PanVK, which reports the same vendor and similar
+    * device names (e.g. "Mali-G720-Immortalis" for the DDK on the CIX CD8180). */
+   auto get_props2 = inst_data.disp.get_fn<PFN_vkGetPhysicalDeviceProperties2KHR>("vkGetPhysicalDeviceProperties2KHR");
+   if (props.apiVersion >= VK_API_VERSION_1_2 && get_props2.has_value())
+   {
+      VkPhysicalDeviceDriverProperties driver_props = {};
+      driver_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+      VkPhysicalDeviceProperties2KHR props2 = {};
+      props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR;
+      props2.pNext = &driver_props;
+      (*get_props2)(physical_device, &props2);
+      if (driver_props.driverID != 0)
+      {
+         return driver_props.driverID == VK_DRIVER_ID_ARM_PROPRIETARY;
+      }
+   }
+
+   return std::strncmp(props.deviceName, "Mali-", 5) == 0;
+}
+
+/**
+ * @brief Get the physical devices exposed to the application by the layer.
+ *
+ * @param      inst_data Layer instance data.
+ * @param      instance  The instance.
+ * @param[out] exposed   Filtered list of physical devices.
+ *
+ * @return VK_SUCCESS or an error returned by the next layer/ICD.
+ */
+static VkResult get_exposed_physical_devices(const instance_private_data &inst_data, VkInstance instance,
+                                             util::vector<VkPhysicalDevice> &exposed)
+{
+   util::vector<VkPhysicalDevice> all_devices(
+      util::allocator(inst_data.get_allocator(), VK_SYSTEM_ALLOCATION_SCOPE_COMMAND));
+
+   /* Devices may appear between the two calls: retry while the down-chain call reports VK_INCOMPLETE. */
+   VkResult res = VK_INCOMPLETE;
+   while (res == VK_INCOMPLETE)
+   {
+      uint32_t count = 0;
+      TRY_LOG(inst_data.disp.EnumeratePhysicalDevices(instance, &count, nullptr),
+              "Failed to get physical device count");
+      if (!all_devices.try_resize(count))
+      {
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      if (count == 0)
+      {
+         res = VK_SUCCESS;
+         break;
+      }
+      res = inst_data.disp.EnumeratePhysicalDevices(instance, &count, all_devices.data());
+      if (res != VK_SUCCESS && res != VK_INCOMPLETE)
+      {
+         WSI_LOG_ERROR("Failed to enumerate physical devices (%d).", static_cast<int>(res));
+         return res;
+      }
+      if (!all_devices.try_resize(count))
+      {
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+   }
+
+   exposed.clear();
+   for (VkPhysicalDevice physical_device : all_devices)
+   {
+      if (is_physical_device_exposed(inst_data, physical_device))
+      {
+         if (!exposed.try_push_back(physical_device))
          {
-            pPhysicalDevices[return_physcial_device_count++] = layer_physical_devices[i];
-         }
-         else
-         {
-            return_physcial_device_count++;
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
          }
       }
       else
       {
-         WSI_LOG_WARNING("WSI layer doesn't support this physcial device: vendorID: 0x%x deviceName: %s\n",
-                         layer_phyical_device_properties[i].vendorID,
-                         layer_phyical_device_properties[i].deviceName);
+         VkPhysicalDeviceProperties props = {};
+         inst_data.disp.GetPhysicalDeviceProperties(physical_device, &props);
+         WSI_LOG_INFO("WSI layer hides physical device \"%s\" (vendorID 0x%x). Set WSI_LAYER_DEVICE_FILTER=all to "
+                      "expose it.",
+                      props.deviceName, props.vendorID);
       }
    }
-   *pPhysicalDeviceCount = return_physcial_device_count;
 
-   alloc.destroy<VkPhysicalDevice>(layer_physical_device_count, layer_physical_devices);
-   alloc.destroy<VkPhysicalDeviceProperties>(layer_physical_device_count, layer_phyical_device_properties);
+   if (exposed.empty() && !all_devices.empty())
+   {
+      WSI_LOG_WARNING("No physical device matches the WSI layer filter, exposing all devices.");
+      if (!exposed.try_push_back_many(all_devices.data(), all_devices.data() + all_devices.size()))
+      {
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+   }
+
    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult enumerate_physical_devices(VkInstance instance, uint32_t *pPhysicalDeviceCount,
+                                               VkPhysicalDevice *pPhysicalDevices)
+{
+   assert(pPhysicalDeviceCount != nullptr);
+   auto &inst_data = layer::instance_private_data::get(instance);
+
+   util::vector<VkPhysicalDevice> exposed(
+      util::allocator(inst_data.get_allocator(), VK_SYSTEM_ALLOCATION_SCOPE_COMMAND));
+   TRY(get_exposed_physical_devices(inst_data, instance, exposed));
+
+   const auto exposed_count = static_cast<uint32_t>(exposed.size());
+   if (pPhysicalDevices == nullptr)
+   {
+      *pPhysicalDeviceCount = exposed_count;
+      return VK_SUCCESS;
+   }
+
+   /* Never write past the application-provided array. */
+   const uint32_t copy_count = std::min(*pPhysicalDeviceCount, exposed_count);
+   for (uint32_t i = 0; i < copy_count; ++i)
+   {
+      pPhysicalDevices[i] = exposed[i];
+   }
+   *pPhysicalDeviceCount = copy_count;
+
+   return copy_count < exposed_count ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult enumerate_physical_device_groups(VkInstance instance, uint32_t *pPhysicalDeviceGroupCount,
+                                                     VkPhysicalDeviceGroupProperties *pPhysicalDeviceGroupProperties)
+{
+   assert(pPhysicalDeviceGroupCount != nullptr);
+   auto &inst_data = layer::instance_private_data::get(instance);
+   util::allocator alloc(inst_data.get_allocator(), VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+
+   util::vector<VkPhysicalDevice> exposed(alloc);
+   TRY(get_exposed_physical_devices(inst_data, instance, exposed));
+   auto is_exposed = [&exposed](VkPhysicalDevice dev) {
+      return std::find(exposed.begin(), exposed.end(), dev) != exposed.end();
+   };
+
+   /* Query the groups from the next layer. */
+   util::vector<VkPhysicalDeviceGroupProperties> groups(alloc);
+   auto enumerate_groups =
+      inst_data.disp.get_fn<PFN_vkEnumeratePhysicalDeviceGroupsKHR>("vkEnumeratePhysicalDeviceGroupsKHR");
+   if (enumerate_groups.has_value())
+   {
+      VkResult res = VK_INCOMPLETE;
+      while (res == VK_INCOMPLETE)
+      {
+         uint32_t count = 0;
+         TRY_LOG((*enumerate_groups)(instance, &count, nullptr), "Failed to get physical device group count");
+         VkPhysicalDeviceGroupProperties empty_group = {};
+         empty_group.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES;
+         groups.clear();
+         if (!groups.try_resize(count, empty_group))
+         {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
+         if (count == 0)
+         {
+            break;
+         }
+         res = (*enumerate_groups)(instance, &count, groups.data());
+         if (res != VK_SUCCESS && res != VK_INCOMPLETE)
+         {
+            return res;
+         }
+         if (!groups.try_resize(count, empty_group))
+         {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
+      }
+   }
+   else
+   {
+      /* Without device group support every device is its own group. */
+      for (VkPhysicalDevice dev : exposed)
+      {
+         VkPhysicalDeviceGroupProperties group = {};
+         group.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES;
+         group.physicalDeviceCount = 1;
+         group.physicalDevices[0] = dev;
+         group.subsetAllocation = VK_FALSE;
+         if (!groups.try_push_back(group))
+         {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
+      }
+   }
+
+   /* Remove hidden devices from the groups and drop groups left empty. */
+   util::vector<VkPhysicalDeviceGroupProperties> filtered(alloc);
+   for (const auto &group : groups)
+   {
+      VkPhysicalDeviceGroupProperties out = {};
+      out.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES;
+      for (uint32_t i = 0; i < group.physicalDeviceCount && i < VK_MAX_DEVICE_GROUP_SIZE; ++i)
+      {
+         if (is_exposed(group.physicalDevices[i]))
+         {
+            out.physicalDevices[out.physicalDeviceCount++] = group.physicalDevices[i];
+         }
+      }
+      if (out.physicalDeviceCount == 0)
+      {
+         continue;
+      }
+      out.subsetAllocation = (out.physicalDeviceCount == group.physicalDeviceCount) ? group.subsetAllocation : VK_FALSE;
+      if (!filtered.try_push_back(out))
+      {
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+   }
+
+   const auto filtered_count = static_cast<uint32_t>(filtered.size());
+   if (pPhysicalDeviceGroupProperties == nullptr)
+   {
+      *pPhysicalDeviceGroupCount = filtered_count;
+      return VK_SUCCESS;
+   }
+
+   const uint32_t copy_count = std::min(*pPhysicalDeviceGroupCount, filtered_count);
+   for (uint32_t i = 0; i < copy_count; ++i)
+   {
+      /* Keep the application's sType/pNext untouched. */
+      pPhysicalDeviceGroupProperties[i].physicalDeviceCount = filtered[i].physicalDeviceCount;
+      std::copy(std::begin(filtered[i].physicalDevices), std::end(filtered[i].physicalDevices),
+                std::begin(pPhysicalDeviceGroupProperties[i].physicalDevices));
+      pPhysicalDeviceGroupProperties[i].subsetAllocation = filtered[i].subsetAllocation;
+   }
+   *pPhysicalDeviceGroupCount = copy_count;
+
+   return copy_count < filtered_count ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult create_device(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCreateInfo,
@@ -500,11 +702,25 @@ wsi_layer_vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo, const VkAllo
 }
 
 VWL_VKAPI_CALL(VkResult)
-wsi_layer_vkEnumeratePhysicalDevices(VkInstance                                  instance,
-                                     uint32_t*                                   pPhysicalDeviceCount,
-                                     VkPhysicalDevice*                           pPhysicalDevices) VWL_API_POST
+wsi_layer_vkEnumeratePhysicalDevices(VkInstance instance, uint32_t *pPhysicalDeviceCount,
+                                     VkPhysicalDevice *pPhysicalDevices) VWL_API_POST
 {
    return layer::enumerate_physical_devices(instance, pPhysicalDeviceCount, pPhysicalDevices);
+}
+
+VWL_VKAPI_CALL(VkResult)
+wsi_layer_vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t *pPhysicalDeviceGroupCount,
+                                          VkPhysicalDeviceGroupProperties *pPhysicalDeviceGroupProperties) VWL_API_POST
+{
+   return layer::enumerate_physical_device_groups(instance, pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
+}
+
+VWL_VKAPI_CALL(VkResult)
+wsi_layer_vkEnumeratePhysicalDeviceGroupsKHR(VkInstance instance, uint32_t *pPhysicalDeviceGroupCount,
+                                             VkPhysicalDeviceGroupProperties *pPhysicalDeviceGroupProperties)
+   VWL_API_POST
+{
+   return layer::enumerate_physical_device_groups(instance, pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
 }
 
 VWL_VKAPI_CALL(VkResult)
@@ -668,6 +884,8 @@ wsi_layer_vkGetInstanceProcAddr(VkInstance instance, const char *funcName) VWL_A
    GET_PROC_ADDR(vkGetDeviceProcAddr);
    GET_PROC_ADDR(vkGetInstanceProcAddr);
    GET_PROC_ADDR(vkEnumeratePhysicalDevices);
+   GET_PROC_ADDR(vkEnumeratePhysicalDeviceGroups);
+   GET_PROC_ADDR(vkEnumeratePhysicalDeviceGroupsKHR);
    GET_PROC_ADDR(vkCreateInstance);
    GET_PROC_ADDR(vkDestroyInstance);
    GET_PROC_ADDR(vkCreateDevice);

@@ -89,6 +89,7 @@ public:
       m_feedback = std::move(feedback_obj.m_feedback);
       m_ext = feedback_obj.m_ext;
       feedback_obj.reset();
+      return *this;
    }
 
    void reset()

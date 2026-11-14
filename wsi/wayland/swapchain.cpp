@@ -717,7 +717,13 @@ VkResult swapchain::image_set_present_payload(swapchain_image &image, VkQueue qu
 
 VkResult swapchain::image_wait_present(swapchain_image &image, uint64_t timeout)
 {
-#if !SUPPORT_EXPLICIT_SYNC
+#if SUPPORT_EXPLICIT_SYNC
+   /* With explicit sync the acquire fence is handed to the compositor, there is nothing to wait for here. */
+   UNUSED(image);
+   UNUSED(timeout);
+   return VK_SUCCESS;
+#else
+   /* Implicit sync: make sure rendering is complete before the buffer is attached to the surface. */
    auto image_data = reinterpret_cast<wayland_image_data *>(image.data);
    return image_data->present_fence.wait_payload(timeout);
 #endif

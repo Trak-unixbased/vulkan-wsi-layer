@@ -1,0 +1,61 @@
+CIX: fix build and runtime issues on Ubuntu 26.04 (Orange Pi 6 Plus)
+
+Build
+- CMake: require 3.19...4.2 (CMake 4.x rejects cmake_minimum_required < 3.5).
+- Display backend: fix "util::drm::(info.format)" compile error.
+- Do not force BUILD_WSI_XCB when BUILD_WSI_WAYLAND is enabled.
+- Generate the manifest with a CMake JSON script instead of sed: sed only
+  removed the "name" line of multi-line entries (nameless objects for
+  VK_EXT_present_timing / VK_KHR_present_wait) and used a wrong name
+  (VK_EXT_xcb_surface) when XCB was disabled.
+- Add install rules (library + manifest with a usable library_path).
+- Pass the DMA-BUF heap names as string literals (drop the -Ulinux hack),
+  make KERNEL_HEADER_DIR optional for dma_buf_heaps.
+- Fail early with a clear message when VULKAN_WSI_LAYER_EXPERIMENTAL is
+  used with headers that already define VK_EXT_present_timing.
+- Optional -Werror (WSI_LAYER_WERROR) and clang-tidy (ENABLE_CLANG_TIDY).
+
+Layer
+- vkEnumeratePhysicalDevices: honour the caller's array size and return
+  VK_INCOMPLETE, always set the count, select the Arm DDK by driverID
+  instead of an exact device name, WSI_LAYER_DEVICE_FILTER override,
+  never hide every device.
+- Filter vkEnumeratePhysicalDeviceGroups(KHR) consistently.
+- vkCreateDevice no longer fails on devices lacking the layer's
+  extensions (llvmpipe...): they are reported as unable to present.
+- has_frame_boundary_support(): use the frame boundary sType.
+- Do not list xcb/xlib as unsupported surfaces when the XCB backend is
+  built (it disabled VK_EXT_swapchain_maintenance1).
+
+Swapchain core
+- Atomic error state; VK_SUBOPTIMAL_KHR can no longer hide an error.
+- Atomic page flip thread run flag, lock image states in deprecate()
+  (ThreadSanitizer data races).
+- Bounded wait for pending buffers at teardown (no infinite loop when the
+  window system never releases a buffer).
+- maxImageExtent = min(16384, maxImageDimension2D).
+
+Wayland
+- image_wait_present(): missing return with SUPPORT_EXPLICIT_SYNC=1.
+- wp_presentation_feedback move assignment: missing return *this.
+
+DMA-BUF heaps allocator
+- Try WSIALLOC_DMA_HEAP, the build-time heap, default_cma_region,
+  linux,cma and reserved; fall back to the system heap when the CMA heap
+  is missing or exhausted. Open heaps with O_CLOEXEC.
+
+XCB/Xlib backend
+- Pixmap creation errors were discarded before being checked.
+- Disjoint planes used plane 0's fd for every plane.
+- Use DRI3 1.2 requests only when the server supports them.
+- get_free_buffer(): process Present events in every mode (FIFO acquire
+  could stall up to 100 ms) and return VK_NOT_READY for a zero timeout
+  (pointer was compared instead of the value).
+- Serialise Present event processing between the page flip thread and the
+  application thread, no round trip per presented frame.
+- MAILBOX uses PresentOptionAsync only on Xwayland (tearing on Xorg).
+- NULL checks on X replies, window depth handling, geometry reply leak,
+  minImageCount clamping, uninitialised members, fd leaks, O_CLOEXEC.
+
+Packaging
+- packaging/build-deb.sh builds a Debian package (implicit layer).

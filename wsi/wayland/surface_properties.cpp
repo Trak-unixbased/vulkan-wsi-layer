@@ -37,6 +37,7 @@
 #include <array>
 #include <cstring>
 #include "surface_properties.hpp"
+#include "wsi/wsi_factory.hpp"
 #include "surface.hpp"
 #include "layer/private_data.hpp"
 #include "wl_helpers.hpp"
@@ -349,9 +350,14 @@ GetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice physical_device,
                                                struct wl_display *display)
 {
    UNUSED(queue_index);
-   bool dev_supports_sync =
-      sync_fd_fence_sync::is_supported(layer::instance_private_data::get(physical_device), physical_device);
+   auto &instance_data = layer::instance_private_data::get(physical_device);
+   bool dev_supports_sync = sync_fd_fence_sync::is_supported(instance_data, physical_device);
    if (!dev_supports_sync)
+   {
+      return VK_FALSE;
+   }
+
+   if (!wsi::is_physical_device_wsi_capable(physical_device, instance_data.get_enabled_platforms()))
    {
       return VK_FALSE;
    }

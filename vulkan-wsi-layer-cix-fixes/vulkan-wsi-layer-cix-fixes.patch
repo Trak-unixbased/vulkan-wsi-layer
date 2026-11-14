@@ -1,0 +1,4575 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index db8fde2..cf6f21a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -20,20 +20,30 @@
+ # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ # SOFTWARE.
+ 
+-cmake_minimum_required(VERSION 3.4.3)
+-project(VkLayer_window_system_integration)
++# CMake 4.x (Ubuntu 26.04 ships 4.2) removed compatibility with projects declaring a minimum below 3.5.
++# The <min>...<max> form keeps the project buildable with both CMake 3.x and 4.x.
++cmake_minimum_required(VERSION 3.19...4.2)
++project(VkLayer_window_system_integration C CXX)
++
++include(GNUInstallDirs)
+ 
+ find_package(PkgConfig REQUIRED)
+ pkg_check_modules(VULKAN_PKG_CONFIG vulkan)
+ 
+-find_program(CLANG_TIDY clang-tidy-8)
+-
+-if (NOT CLANG_TIDY STREQUAL "CLANG_TIDY-NOTFOUND")
+-   message(STATUS "Using clang-tidy: ${CLANG_TIDY}")
+-   set(CMAKE_CXX_CLANG_TIDY ${CLANG_TIDY} -checks=bugprone-*,modernize-*)
++option(ENABLE_CLANG_TIDY "Run clang-tidy while compiling" OFF)
++if(ENABLE_CLANG_TIDY)
++   find_program(CLANG_TIDY NAMES clang-tidy clang-tidy-8)
++   if(CLANG_TIDY)
++      message(STATUS "Using clang-tidy: ${CLANG_TIDY}")
++      set(CMAKE_CXX_CLANG_TIDY ${CLANG_TIDY} -checks=bugprone-*,modernize-*)
++   endif()
+ endif()
+ 
++option(WSI_LAYER_WERROR "Treat compiler warnings as errors" OFF)
+ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pthread -fPIC")
++if(WSI_LAYER_WERROR)
++   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
++endif()
+ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
+ set(CMAKE_CXX_STANDARD 17)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+@@ -54,6 +64,12 @@ else()
+    message(FATAL_ERROR "Either vulkan.pc must be available or VULKAN_CXX_INCLUDE must be defined")
+ endif()
+ 
++# Locate vulkan_core.h to check the header version against the experimental code.
++find_file(VULKAN_CORE_HEADER vulkan/vulkan_core.h PATHS ${VULKAN_CXX_INCLUDE} NO_DEFAULT_PATH)
++if(NOT VULKAN_CORE_HEADER)
++   find_file(VULKAN_CORE_HEADER vulkan/vulkan_core.h)
++endif()
++
+ # Build Configuration options
+ 
+ # Backend support
+@@ -62,9 +78,12 @@ option(BUILD_WSI_WAYLAND "Build with support for VK_KHR_wayland_surface" OFF)
+ option(BUILD_WSI_DISPLAY "Build with support for VK_KHR_display" OFF)
+ option(BUILD_WSI_XCB "Build with support for VK_KHR_xcb_surface" OFF)
+ 
+-set(SELECT_EXTERNAL_ALLOCATOR "none" CACHE STRING "Select an external system allocator (none, dma_buf_heaps)")
+-set(EXTERNAL_WSIALLOC_LIBRARY "" CACHE STRING "External imple-DSELECT_EXTERNAL_ALLOCATORmentation of the wsialloc interface to use")
+-set(WSIALLOC_MEMORY_HEAP_NAME "linux,cma" CACHE STRING "Heap name used by the dma_buf_heaps allocator")
++set(SELECT_EXTERNAL_ALLOCATOR "none" CACHE STRING "Select an external system allocator (none, ion, dma_buf_heaps)")
++set(EXTERNAL_WSIALLOC_LIBRARY "" CACHE STRING "External implementation of the wsialloc interface to use")
++set(WSIALLOC_MEMORY_HEAP_NAME "linux,cma" CACHE STRING "Preferred heap name used by the dma_buf_heaps allocator")
++set(WSIALLOC_FALLBACK_HEAP_NAME "system" CACHE STRING
++    "Heap used by the dma_buf_heaps allocator when the preferred heap is missing or exhausted (empty to disable)")
++option(WSI_LAYER_INSTALL_IMPLICIT "Install the layer manifest as an implicit layer" ON)
+ 
+ # Optional features
+ option(BUILD_WSI_DISPLAY_SUPPORT_FORMAT_MODIFIERS "Build with support for format modifiers in VK_KHR_display" ON)
+@@ -77,8 +96,16 @@ option(WAYLAND_SUPPORT_EXPLICIT_SYNC "Enable Wayland linux-explicit-synchronizat
+ # VK_EXT_frame_boundary then the layer will not pass its own frame boundary events.
+ option(ENABLE_INSTRUMENTATION "Pass frame boundary events by using VK_EXT_frame_boundary" OFF)
+ 
+-if(BUILD_WSI_WAYLAND)
+-   set(BUILD_WSI_XCB true)
++# The experimental code declares its own provisional VK_EXT_present_timing API. Since Vulkan 1.4.33x the extension is
++# part of the official headers with a different API (spec version 3), so both cannot coexist (Ubuntu 26.04 ships
++# 1.4.341). Fail early with a clear message instead of a wall of redefinition errors.
++if(VULKAN_WSI_LAYER_EXPERIMENTAL AND VULKAN_CORE_HEADER)
++   file(STRINGS "${VULKAN_CORE_HEADER}" VULKAN_HAS_PRESENT_TIMING REGEX "^#define VK_EXT_present_timing 1")
++   if(VULKAN_HAS_PRESENT_TIMING)
++      message(FATAL_ERROR "VULKAN_WSI_LAYER_EXPERIMENTAL requires Vulkan headers without the official "
++                          "VK_EXT_present_timing extension (${VULKAN_CORE_HEADER} defines it). "
++                          "Build with -DVULKAN_WSI_LAYER_EXPERIMENTAL=OFF.")
++   endif()
+ endif()
+ 
+ if(BUILD_WSI_WAYLAND OR BUILD_WSI_DISPLAY)
+@@ -125,12 +152,15 @@ if(NOT SELECT_EXTERNAL_ALLOCATOR STREQUAL "none" AND EXTERNAL_WSIALLOC_LIBRARY S
+    elseif(SELECT_EXTERNAL_ALLOCATOR STREQUAL "dma_buf_heaps")
+       target_sources(wsialloc PRIVATE util/wsialloc/wsialloc_dma_buf_heaps.c util/wsialloc/wsialloc_helpers.c)
+       target_link_libraries(wsialloc drm_utils)
++      # linux/dma-heap.h is part of the kernel UAPI (linux-libc-dev), so KERNEL_HEADER_DIR is optional here.
+       if(DEFINED KERNEL_HEADER_DIR)
+          target_include_directories(wsialloc PRIVATE "${KERNEL_HEADER_DIR}")
+-      else()
+-         message(FATAL_ERROR "KERNEL_HEADER_DIR must be defined as the directory that includes the kernel headers.")
+       endif()
+-      add_definitions(-Ulinux -DWSIALLOC_MEMORY_HEAP_NAME=${WSIALLOC_MEMORY_HEAP_NAME})
++      # Heap names are passed as string literals, which avoids the former "-Ulinux" hack that was needed
++      # to stop the preprocessor from expanding the "linux" token of "linux,cma".
++      target_compile_definitions(wsialloc PRIVATE
++         "WSIALLOC_MEMORY_HEAP_NAME=\"${WSIALLOC_MEMORY_HEAP_NAME}\""
++         "WSIALLOC_FALLBACK_HEAP_NAME=\"${WSIALLOC_FALLBACK_HEAP_NAME}\"")
+    else()
+       message(FATAL_ERROR "Invalid external allocator selected: ${SELECT_EXTERNAL_ALLOCATOR}")
+    endif()
+@@ -225,7 +255,7 @@ if(BUILD_WSI_WAYLAND)
+       target_compile_definitions(wayland_wsi PRIVATE "-DSUPPORT_EXPLICIT_SYNC=0")
+    endif()
+ else()
+-   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_KHR_wayland_surface/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
++   list(APPEND WSI_MANIFEST_REMOVED_EXTENSIONS VK_KHR_wayland_surface)
+ endif()
+ 
+ # Headless
+@@ -243,14 +273,12 @@ if(BUILD_WSI_HEADLESS)
+       ${PROJECT_SOURCE_DIR}
+       ${VULKAN_CXX_INCLUDE}
+       ${THIRDPARTY_INCLUDE}
+-      ${CMAKE_CURRENT_BINARY_DIR}
+-      ${XCB_INCLUDE_DIRS})
++      ${CMAKE_CURRENT_BINARY_DIR})
+ 
+    target_compile_options(wsi_headless INTERFACE "-DBUILD_WSI_HEADLESS=1")
+    list(APPEND LINK_WSI_LIBS wsi_headless)
+ else()
+-   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_EXT_headless_surface/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+-   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_KHR_shared_presentable_image/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
++   list(APPEND WSI_MANIFEST_REMOVED_EXTENSIONS VK_EXT_headless_surface VK_KHR_shared_presentable_image)
+ endif()
+ 
+ # Display
+@@ -283,7 +311,7 @@ if (BUILD_WSI_DISPLAY)
+    endif()
+    list(APPEND LINK_WSI_LIBS wsi_display)
+ else()
+-   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_KHR_display/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
++   list(APPEND WSI_MANIFEST_REMOVED_EXTENSIONS VK_KHR_display)
+ endif()
+ 
+ # Xcb
+@@ -316,12 +344,12 @@ if(BUILD_WSI_XCB)
+    message(STATUS "Using xshmfence ldflags: ${XSHMFENCE_LDFLAGS}")
+ 
+    pkg_check_modules(XCB_SYNC REQUIRED xcb-sync)
+-   message(STATUS "Using xcb-sync include directories: ${XCB_INCLUDE_DIRS}")
++   message(STATUS "Using xcb-sync include directories: ${XCB_SYNC_INCLUDE_DIRS}")
+    message(STATUS "Using xcb-sync cflags: ${XCB_SYNC_CFLAGS}")
+    message(STATUS "Using xcb-sync ldflags: ${XCB_SYNC_LDFLAGS}")
+ 
+    pkg_check_modules(X11_XCB REQUIRED x11-xcb)
+-   message(STATUS "Using x11-xcb include directories: ${X11_INCLUDE_DIRS}")
++   message(STATUS "Using x11-xcb include directories: ${X11_XCB_INCLUDE_DIRS}")
+    message(STATUS "Using x11-xcb cflags: ${X11_XCB_CFLAGS}")
+    message(STATUS "Using x11-xcb ldflags: ${X11_XCB_LDFLAGS}")
+ 
+@@ -343,7 +371,8 @@ if(BUILD_WSI_XCB)
+ 
+    list(APPEND LINK_WSI_LIBS xcb_wsi)
+ else()
+-   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_EXT_xcb_surface/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
++   # The manifest advertises both VK_KHR_xcb_surface and VK_KHR_xlib_surface: strip both when XCB is disabled.
++   list(APPEND WSI_MANIFEST_REMOVED_EXTENSIONS VK_KHR_xcb_surface VK_KHR_xlib_surface)
+ endif()
+ 
+ # Layer
+@@ -374,7 +403,7 @@ if (VULKAN_WSI_LAYER_EXPERIMENTAL)
+    target_sources(${PROJECT_NAME} PUBLIC ${PROJECT_SOURCE_DIR}/wsi/extensions/present_timing.cpp)
+    add_definitions("-DVULKAN_WSI_LAYER_EXPERIMENTAL=1")
+ else()
+-   list(APPEND JSON_COMMANDS COMMAND sed -Ei '/VK_EXT_present_timing|VK_KHR_present_wait/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
++   list(APPEND WSI_MANIFEST_REMOVED_EXTENSIONS VK_EXT_present_timing VK_KHR_present_wait)
+    add_definitions("-DVULKAN_WSI_LAYER_EXPERIMENTAL=0")
+ endif()
+ 
+@@ -396,6 +425,39 @@ endif()
+ 
+ target_link_libraries(${PROJECT_NAME} ${LINK_WSI_LIBS})
+ 
+-add_custom_target(manifest_json ALL COMMAND
+-   cp ${PROJECT_SOURCE_DIR}/layer/VkLayer_window_system_integration.json ${CMAKE_CURRENT_BINARY_DIR}
+-   ${JSON_COMMANDS})
++set(WSI_LAYER_LIBRARY_FILE "${CMAKE_SHARED_LIBRARY_PREFIX}${PROJECT_NAME}${CMAKE_SHARED_LIBRARY_SUFFIX}")
++set(WSI_LAYER_MANIFEST_TEMPLATE "${PROJECT_SOURCE_DIR}/layer/VkLayer_window_system_integration.json")
++set(WSI_LAYER_MANIFEST_SCRIPT "${PROJECT_SOURCE_DIR}/layer/generate_manifest.cmake")
++set(WSI_LAYER_BUILD_MANIFEST "${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json")
++set(WSI_LAYER_INSTALL_MANIFEST "${CMAKE_CURRENT_BINARY_DIR}/install/VkLayer_window_system_integration.json")
++string(REPLACE ";" "|" WSI_MANIFEST_REMOVED_EXTENSIONS_ARG "${WSI_MANIFEST_REMOVED_EXTENSIONS}")
++
++# library_path written in the installed manifest. The default absolute path always works; distribution packages
++# may use the bare file name (resolved by the dynamic loader search path), which keeps the manifest identical across
++# architectures (required for Multi-Arch: same).
++set(WSI_LAYER_MANIFEST_LIBRARY_PATH "${CMAKE_INSTALL_FULL_LIBDIR}/${WSI_LAYER_LIBRARY_FILE}" CACHE STRING
++    "library_path of the installed layer manifest")
++
++# The build-tree manifest keeps the relative "./lib..." path so that VK_LAYER_PATH=<build dir> works.
++# The installed manifest needs an absolute path: a relative path is resolved against the manifest directory
++# (/usr/share/vulkan/...), not against the library directory.
++add_custom_command(
++   OUTPUT ${WSI_LAYER_BUILD_MANIFEST} ${WSI_LAYER_INSTALL_MANIFEST}
++   COMMAND ${CMAKE_COMMAND} -DINPUT=${WSI_LAYER_MANIFEST_TEMPLATE} -DOUTPUT=${WSI_LAYER_BUILD_MANIFEST}
++           -DREMOVE_EXTENSIONS=${WSI_MANIFEST_REMOVED_EXTENSIONS_ARG} -P ${WSI_LAYER_MANIFEST_SCRIPT}
++   COMMAND ${CMAKE_COMMAND} -DINPUT=${WSI_LAYER_MANIFEST_TEMPLATE} -DOUTPUT=${WSI_LAYER_INSTALL_MANIFEST}
++           -DREMOVE_EXTENSIONS=${WSI_MANIFEST_REMOVED_EXTENSIONS_ARG}
++           -DLIBRARY_PATH=${WSI_LAYER_MANIFEST_LIBRARY_PATH} -P ${WSI_LAYER_MANIFEST_SCRIPT}
++   DEPENDS ${WSI_LAYER_MANIFEST_TEMPLATE} ${WSI_LAYER_MANIFEST_SCRIPT}
++   COMMENT "Generating Vulkan layer manifests"
++   VERBATIM)
++add_custom_target(manifest_json ALL DEPENDS ${WSI_LAYER_BUILD_MANIFEST} ${WSI_LAYER_INSTALL_MANIFEST})
++
++# Installation
++install(TARGETS ${PROJECT_NAME} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
++if(WSI_LAYER_INSTALL_IMPLICIT)
++   set(WSI_LAYER_MANIFEST_DIR "${CMAKE_INSTALL_DATADIR}/vulkan/implicit_layer.d")
++else()
++   set(WSI_LAYER_MANIFEST_DIR "${CMAKE_INSTALL_DATADIR}/vulkan/explicit_layer.d")
++endif()
++install(FILES ${WSI_LAYER_INSTALL_MANIFEST} DESTINATION ${WSI_LAYER_MANIFEST_DIR})
+diff --git a/README.md b/README.md
+index 55afcb9..aaa8409 100644
+--- a/README.md
++++ b/README.md
+@@ -167,6 +167,45 @@ Copy the shared library `libVkLayer_window_system_integration.so` and JSON
+ configuration `VkLayer_window_system_integration.json` into a Vulkan®
+ [implicit layer directory](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderLayerInterface.md#linux-layer-discovery).
+ 
++`cmake --install` does this automatically: the library goes to
++`${CMAKE_INSTALL_LIBDIR}` and the manifest (with an absolute `library_path`,
++configurable through `WSI_LAYER_MANIFEST_LIBRARY_PATH`) to
++`share/vulkan/implicit_layer.d` (`share/vulkan/explicit_layer.d` with
++`-DWSI_LAYER_INSTALL_IMPLICIT=OFF`).
++
++### Debian/Ubuntu package (Orange Pi 6 Plus, CIX CD8180)
++
++`packaging/build-deb.sh` builds a `.deb` for the native architecture with the
++headless, Wayland and XCB/Xlib backends and the `dma_buf_heaps` allocator.
++On Ubuntu 26.04 arm64:
++
++```
++packaging/build-deb.sh --install-deps
++sudo apt install ./dist/vulkan-wsi-layer_*_arm64.deb
++```
++
++Run `packaging/build-deb.sh --help` for the available options.
++
++### Run-time environment variables
++
++* `DISABLE_WSI_LAYER=1`: disable the layer (loader standard).
++* `WSI_LAYER_DEVICE_FILTER`: physical devices exposed by the layer. By default
++  only the Arm proprietary (Mali DDK) driver is exposed, because other drivers
++  (llvmpipe, PanVK...) either ship their own WSI or lack the extensions the
++  layer needs. `all` disables the filter, any other value exposes the devices
++  whose name contains it. If nothing matches, every device is exposed.
++* `WSIALLOC_DMA_HEAP`: DMA-BUF heap used for swapchain images (default: the
++  build-time `WSIALLOC_MEMORY_HEAP_NAME`, then `default_cma_region`,
++  `linux,cma`, `reserved`).
++* `WSIALLOC_FALLBACK_DMA_HEAP`: heap used when the preferred one is missing or
++  exhausted (default `system`, empty to disable).
++* `XCB_SWAPCHAIN_MIN_IMAGE_COUNT`: minimum swapchain image count reported for
++  X11 surfaces (default 4, clamped to the supported range).
++* `WSI_XCB_MAILBOX_ASYNC=0|1`: force the use of `XCB_PRESENT_OPTION_ASYNC` for
++  MAILBOX on X11 (default: enabled on Xwayland only, where it does not tear).
++* `DISABLE_XCB_FLIP`: force copies instead of page flips on X11.
++* `DISABLE_XCB_PRESENT_THREAD`: present from the application thread on X11.
++
+ ## Contributing
+ 
+ We are open for contributions.
+diff --git a/layer/generate_manifest.cmake b/layer/generate_manifest.cmake
+new file mode 100644
+index 0000000..f1046f1
+--- /dev/null
++++ b/layer/generate_manifest.cmake
+@@ -0,0 +1,70 @@
++# Copyright (c) 2026 vulkan-wsi-layer contributors.
++#
++# SPDX-License-Identifier: MIT
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to
++# deal in the Software without restriction, including without limitation the
++# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++# sell copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++# Generates the layer manifest from layer/VkLayer_window_system_integration.json.
++#
++# Usage:
++#   cmake -DINPUT=<template.json> -DOUTPUT=<manifest.json>
++#         [-DREMOVE_EXTENSIONS=ext1|ext2|...] [-DLIBRARY_PATH=<path>]
++#         -P generate_manifest.cmake
++#
++# Extensions are removed as whole JSON objects. The previous implementation used "sed /name/d", which only
++# deleted the "name" line of multi-line entries (VK_EXT_present_timing, VK_KHR_present_wait) and left
++# nameless objects in the manifest.
++
++cmake_minimum_required(VERSION 3.19)
++
++if(NOT DEFINED INPUT OR NOT DEFINED OUTPUT)
++   message(FATAL_ERROR "generate_manifest.cmake: INPUT and OUTPUT must be defined")
++endif()
++
++file(READ "${INPUT}" manifest)
++
++set(remove_list "")
++if(DEFINED REMOVE_EXTENSIONS AND NOT REMOVE_EXTENSIONS STREQUAL "")
++   string(REPLACE "|" ";" remove_list "${REMOVE_EXTENSIONS}")
++endif()
++
++foreach(section IN ITEMS instance_extensions device_extensions)
++   string(JSON count ERROR_VARIABLE json_error LENGTH "${manifest}" layer ${section})
++   if(json_error)
++      continue()
++   endif()
++
++   # Walk backwards so that removing an element does not shift the indices still to be visited.
++   math(EXPR index "${count} - 1")
++   while(index GREATER_EQUAL 0)
++      string(JSON ext_name GET "${manifest}" layer ${section} ${index} name)
++      if(ext_name IN_LIST remove_list)
++         string(JSON manifest REMOVE "${manifest}" layer ${section} ${index})
++      endif()
++      math(EXPR index "${index} - 1")
++   endwhile()
++endforeach()
++
++if(DEFINED LIBRARY_PATH AND NOT LIBRARY_PATH STREQUAL "")
++   string(JSON manifest SET "${manifest}" layer library_path "\"${LIBRARY_PATH}\"")
++endif()
++
++get_filename_component(output_dir "${OUTPUT}" DIRECTORY)
++file(MAKE_DIRECTORY "${output_dir}")
++file(WRITE "${OUTPUT}" "${manifest}\n")
+diff --git a/layer/layer.cpp b/layer/layer.cpp
+index 61af71b..222e265 100644
+--- a/layer/layer.cpp
++++ b/layer/layer.cpp
+@@ -25,7 +25,10 @@
+ #include <cassert>
+ #include <cstdio>
+ #include <cstring>
++#include <algorithm>
+ #include <array>
++#include <cstdlib>
++#include <iterator>
+ 
+ #include <vulkan/vk_layer.h>
+ #include <vulkan/vulkan.h>
+@@ -205,73 +208,272 @@ VKAPI_ATTR VkResult create_instance(const VkInstanceCreateInfo *pCreateInfo, con
+    return VK_SUCCESS;
+ }
+ 
+-VKAPI_ATTR VkResult enumerate_physical_devices(VkInstance                                  instance,
+-                                               uint32_t*                                   pPhysicalDeviceCount,
+-                                               VkPhysicalDevice*                           pPhysicalDevices)
++/* Physical device filtering.
++ *
++ * The CIX/Mali DDK relies on this layer for window system integration. Other Vulkan drivers that may be installed
++ * next to it (lavapipe, Mesa PanVK, ...) either ship their own WSI or lack the external memory extensions the layer
++ * requires, and letting the layer wrap them crashed tools such as vulkaninfo. Only the Arm proprietary driver is
++ * therefore exposed by default.
++ *
++ * The behaviour can be changed with the WSI_LAYER_DEVICE_FILTER environment variable:
++ *   unset          Expose Arm proprietary (Mali) devices only (default).
++ *   "all" / "*"    Disable filtering.
++ *   any other text Expose the devices whose deviceName contains this text.
++ *
++ * If no device matches, every device is exposed rather than leaving the application without any GPU.
++ * vkEnumeratePhysicalDevices and vkEnumeratePhysicalDeviceGroups always expose the same set of devices.
++ */
++static constexpr uint32_t ARM_VENDOR_ID = 0x13b5;
++
++static bool is_physical_device_exposed(const instance_private_data &inst_data, VkPhysicalDevice physical_device)
+ {
+-   if (instance == VK_NULL_HANDLE)
++   VkPhysicalDeviceProperties props = {};
++   inst_data.disp.GetPhysicalDeviceProperties(physical_device, &props);
++
++   const char *filter = std::getenv("WSI_LAYER_DEVICE_FILTER");
++   if (filter != nullptr && filter[0] != '\0')
+    {
+-      return VK_ERROR_INITIALIZATION_FAILED;
++      if (std::strcmp(filter, "all") == 0 || std::strcmp(filter, "*") == 0)
++      {
++         return true;
++      }
++      return std::strstr(props.deviceName, filter) != nullptr;
+    }
+ 
+-   auto &inst_data = layer::instance_private_data::get(instance);
+-   auto alloc = inst_data.get_allocator();
+-   auto fn_enumerate_physical_devices = inst_data.disp.get_fn<PFN_vkEnumeratePhysicalDevices>("vkEnumeratePhysicalDevices");
++   if (props.vendorID != ARM_VENDOR_ID)
++   {
++      return false;
++   }
+ 
+-   // Get physical device count
+-   uint32_t layer_physical_device_count = 0;
+-   assert(fn_enumerate_physical_devices.has_value());
+-   TRY_LOG((*fn_enumerate_physical_devices)(instance, &layer_physical_device_count, NULL), "Failed to get physical device count");
+-   if (layer_physical_device_count == 0)
++   /* Prefer the driver ID: it tells the Arm DDK apart from Mesa PanVK, which reports the same vendor and similar
++    * device names (e.g. "Mali-G720-Immortalis" for the DDK on the CIX CD8180). */
++   auto get_props2 = inst_data.disp.get_fn<PFN_vkGetPhysicalDeviceProperties2KHR>("vkGetPhysicalDeviceProperties2KHR");
++   if (props.apiVersion >= VK_API_VERSION_1_2 && get_props2.has_value())
+    {
+-      return VK_INCOMPLETE;
++      VkPhysicalDeviceDriverProperties driver_props = {};
++      driver_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
++      VkPhysicalDeviceProperties2KHR props2 = {};
++      props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR;
++      props2.pNext = &driver_props;
++      (*get_props2)(physical_device, &props2);
++      if (driver_props.driverID != 0)
++      {
++         return driver_props.driverID == VK_DRIVER_ID_ARM_PROPRIETARY;
++      }
+    }
+ 
+-   // Enumerate physical devices
+-   VkPhysicalDevice *layer_physical_devices = alloc.create<VkPhysicalDevice>(layer_physical_device_count);
+-   if (layer_physical_devices == NULL)
++   return std::strncmp(props.deviceName, "Mali-", 5) == 0;
++}
++
++/**
++ * @brief Get the physical devices exposed to the application by the layer.
++ *
++ * @param      inst_data Layer instance data.
++ * @param      instance  The instance.
++ * @param[out] exposed   Filtered list of physical devices.
++ *
++ * @return VK_SUCCESS or an error returned by the next layer/ICD.
++ */
++static VkResult get_exposed_physical_devices(const instance_private_data &inst_data, VkInstance instance,
++                                             util::vector<VkPhysicalDevice> &exposed)
++{
++   util::vector<VkPhysicalDevice> all_devices(
++      util::allocator(inst_data.get_allocator(), VK_SYSTEM_ALLOCATION_SCOPE_COMMAND));
++
++   /* Devices may appear between the two calls: retry while the down-chain call reports VK_INCOMPLETE. */
++   VkResult res = VK_INCOMPLETE;
++   while (res == VK_INCOMPLETE)
+    {
+-      return VK_ERROR_OUT_OF_HOST_MEMORY;
++      uint32_t count = 0;
++      TRY_LOG(inst_data.disp.EnumeratePhysicalDevices(instance, &count, nullptr),
++              "Failed to get physical device count");
++      if (!all_devices.try_resize(count))
++      {
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++      if (count == 0)
++      {
++         res = VK_SUCCESS;
++         break;
++      }
++      res = inst_data.disp.EnumeratePhysicalDevices(instance, &count, all_devices.data());
++      if (res != VK_SUCCESS && res != VK_INCOMPLETE)
++      {
++         WSI_LOG_ERROR("Failed to enumerate physical devices (%d).", static_cast<int>(res));
++         return res;
++      }
++      if (!all_devices.try_resize(count))
++      {
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
+    }
+-   TRY_LOG((*fn_enumerate_physical_devices)(instance, &layer_physical_device_count, layer_physical_devices), "Failed to enumerate physical devices");
+ 
+-   VkPhysicalDeviceProperties* layer_phyical_device_properties = alloc.create<VkPhysicalDeviceProperties>(layer_physical_device_count);
+-   if (layer_phyical_device_properties == NULL)
++   exposed.clear();
++   for (VkPhysicalDevice physical_device : all_devices)
+    {
+-      alloc.destroy<VkPhysicalDevice>(layer_physical_device_count, layer_physical_devices);
+-      return VK_ERROR_OUT_OF_HOST_MEMORY;
++      if (is_physical_device_exposed(inst_data, physical_device))
++      {
++         if (!exposed.try_push_back(physical_device))
++         {
++            return VK_ERROR_OUT_OF_HOST_MEMORY;
++         }
++      }
++      else
++      {
++         VkPhysicalDeviceProperties props = {};
++         inst_data.disp.GetPhysicalDeviceProperties(physical_device, &props);
++         WSI_LOG_INFO("WSI layer hides physical device \"%s\" (vendorID 0x%x). Set WSI_LAYER_DEVICE_FILTER=all to "
++                      "expose it.",
++                      props.deviceName, props.vendorID);
++      }
++   }
++
++   if (exposed.empty() && !all_devices.empty())
++   {
++      WSI_LOG_WARNING("No physical device matches the WSI layer filter, exposing all devices.");
++      if (!exposed.try_push_back_many(all_devices.data(), all_devices.data() + all_devices.size()))
++      {
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++   }
++
++   return VK_SUCCESS;
++}
++
++VKAPI_ATTR VkResult enumerate_physical_devices(VkInstance instance, uint32_t *pPhysicalDeviceCount,
++                                               VkPhysicalDevice *pPhysicalDevices)
++{
++   assert(pPhysicalDeviceCount != nullptr);
++   auto &inst_data = layer::instance_private_data::get(instance);
++
++   util::vector<VkPhysicalDevice> exposed(
++      util::allocator(inst_data.get_allocator(), VK_SYSTEM_ALLOCATION_SCOPE_COMMAND));
++   TRY(get_exposed_physical_devices(inst_data, instance, exposed));
++
++   const auto exposed_count = static_cast<uint32_t>(exposed.size());
++   if (pPhysicalDevices == nullptr)
++   {
++      *pPhysicalDeviceCount = exposed_count;
++      return VK_SUCCESS;
+    }
+ 
+-   uint32_t return_physcial_device_count = 0;
+-   for (uint32_t i = 0; i < layer_physical_device_count; ++i)
++   /* Never write past the application-provided array. */
++   const uint32_t copy_count = std::min(*pPhysicalDeviceCount, exposed_count);
++   for (uint32_t i = 0; i < copy_count; ++i)
+    {
+-      // Get the physical device properties
+-      layer::instance_private_data::get(layer_physical_devices[i]).disp.GetPhysicalDeviceProperties(layer_physical_devices[i], &layer_phyical_device_properties[i]);
+-      // Add only Mali-G720-Immortalis device to the list of returned physical devices
+-      if (layer_phyical_device_properties[i].vendorID == 0x13b5 &&
+-         strcmp(layer_phyical_device_properties[i].deviceName,"Mali-G720-Immortalis") == 0)
++      pPhysicalDevices[i] = exposed[i];
++   }
++   *pPhysicalDeviceCount = copy_count;
++
++   return copy_count < exposed_count ? VK_INCOMPLETE : VK_SUCCESS;
++}
++
++VKAPI_ATTR VkResult enumerate_physical_device_groups(VkInstance instance, uint32_t *pPhysicalDeviceGroupCount,
++                                                     VkPhysicalDeviceGroupProperties *pPhysicalDeviceGroupProperties)
++{
++   assert(pPhysicalDeviceGroupCount != nullptr);
++   auto &inst_data = layer::instance_private_data::get(instance);
++   util::allocator alloc(inst_data.get_allocator(), VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
++
++   util::vector<VkPhysicalDevice> exposed(alloc);
++   TRY(get_exposed_physical_devices(inst_data, instance, exposed));
++   auto is_exposed = [&exposed](VkPhysicalDevice dev) {
++      return std::find(exposed.begin(), exposed.end(), dev) != exposed.end();
++   };
++
++   /* Query the groups from the next layer. */
++   util::vector<VkPhysicalDeviceGroupProperties> groups(alloc);
++   auto enumerate_groups =
++      inst_data.disp.get_fn<PFN_vkEnumeratePhysicalDeviceGroupsKHR>("vkEnumeratePhysicalDeviceGroupsKHR");
++   if (enumerate_groups.has_value())
++   {
++      VkResult res = VK_INCOMPLETE;
++      while (res == VK_INCOMPLETE)
+       {
+-         if (pPhysicalDevices != NULL)
++         uint32_t count = 0;
++         TRY_LOG((*enumerate_groups)(instance, &count, nullptr), "Failed to get physical device group count");
++         VkPhysicalDeviceGroupProperties empty_group = {};
++         empty_group.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES;
++         groups.clear();
++         if (!groups.try_resize(count, empty_group))
+          {
+-            pPhysicalDevices[return_physcial_device_count++] = layer_physical_devices[i];
++            return VK_ERROR_OUT_OF_HOST_MEMORY;
+          }
+-         else
++         if (count == 0)
+          {
+-            return_physcial_device_count++;
++            break;
++         }
++         res = (*enumerate_groups)(instance, &count, groups.data());
++         if (res != VK_SUCCESS && res != VK_INCOMPLETE)
++         {
++            return res;
++         }
++         if (!groups.try_resize(count, empty_group))
++         {
++            return VK_ERROR_OUT_OF_HOST_MEMORY;
+          }
+       }
+-      else
++   }
++   else
++   {
++      /* Without device group support every device is its own group. */
++      for (VkPhysicalDevice dev : exposed)
+       {
+-         WSI_LOG_WARNING("WSI layer doesn't support this physcial device: vendorID: 0x%x deviceName: %s\n",
+-                         layer_phyical_device_properties[i].vendorID,
+-                         layer_phyical_device_properties[i].deviceName);
++         VkPhysicalDeviceGroupProperties group = {};
++         group.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES;
++         group.physicalDeviceCount = 1;
++         group.physicalDevices[0] = dev;
++         group.subsetAllocation = VK_FALSE;
++         if (!groups.try_push_back(group))
++         {
++            return VK_ERROR_OUT_OF_HOST_MEMORY;
++         }
+       }
+    }
+-   *pPhysicalDeviceCount = return_physcial_device_count;
+ 
+-   alloc.destroy<VkPhysicalDevice>(layer_physical_device_count, layer_physical_devices);
+-   alloc.destroy<VkPhysicalDeviceProperties>(layer_physical_device_count, layer_phyical_device_properties);
+-   return VK_SUCCESS;
++   /* Remove hidden devices from the groups and drop groups left empty. */
++   util::vector<VkPhysicalDeviceGroupProperties> filtered(alloc);
++   for (const auto &group : groups)
++   {
++      VkPhysicalDeviceGroupProperties out = {};
++      out.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES;
++      for (uint32_t i = 0; i < group.physicalDeviceCount && i < VK_MAX_DEVICE_GROUP_SIZE; ++i)
++      {
++         if (is_exposed(group.physicalDevices[i]))
++         {
++            out.physicalDevices[out.physicalDeviceCount++] = group.physicalDevices[i];
++         }
++      }
++      if (out.physicalDeviceCount == 0)
++      {
++         continue;
++      }
++      out.subsetAllocation = (out.physicalDeviceCount == group.physicalDeviceCount) ? group.subsetAllocation : VK_FALSE;
++      if (!filtered.try_push_back(out))
++      {
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++   }
++
++   const auto filtered_count = static_cast<uint32_t>(filtered.size());
++   if (pPhysicalDeviceGroupProperties == nullptr)
++   {
++      *pPhysicalDeviceGroupCount = filtered_count;
++      return VK_SUCCESS;
++   }
++
++   const uint32_t copy_count = std::min(*pPhysicalDeviceGroupCount, filtered_count);
++   for (uint32_t i = 0; i < copy_count; ++i)
++   {
++      /* Keep the application's sType/pNext untouched. */
++      pPhysicalDeviceGroupProperties[i].physicalDeviceCount = filtered[i].physicalDeviceCount;
++      std::copy(std::begin(filtered[i].physicalDevices), std::end(filtered[i].physicalDevices),
++                std::begin(pPhysicalDeviceGroupProperties[i].physicalDevices));
++      pPhysicalDeviceGroupProperties[i].subsetAllocation = filtered[i].subsetAllocation;
++   }
++   *pPhysicalDeviceGroupCount = copy_count;
++
++   return copy_count < filtered_count ? VK_INCOMPLETE : VK_SUCCESS;
+ }
+ 
+ VKAPI_ATTR VkResult create_device(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCreateInfo,
+@@ -500,13 +702,27 @@ wsi_layer_vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo, const VkAllo
+ }
+ 
+ VWL_VKAPI_CALL(VkResult)
+-wsi_layer_vkEnumeratePhysicalDevices(VkInstance                                  instance,
+-                                     uint32_t*                                   pPhysicalDeviceCount,
+-                                     VkPhysicalDevice*                           pPhysicalDevices) VWL_API_POST
++wsi_layer_vkEnumeratePhysicalDevices(VkInstance instance, uint32_t *pPhysicalDeviceCount,
++                                     VkPhysicalDevice *pPhysicalDevices) VWL_API_POST
+ {
+    return layer::enumerate_physical_devices(instance, pPhysicalDeviceCount, pPhysicalDevices);
+ }
+ 
++VWL_VKAPI_CALL(VkResult)
++wsi_layer_vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t *pPhysicalDeviceGroupCount,
++                                          VkPhysicalDeviceGroupProperties *pPhysicalDeviceGroupProperties) VWL_API_POST
++{
++   return layer::enumerate_physical_device_groups(instance, pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
++}
++
++VWL_VKAPI_CALL(VkResult)
++wsi_layer_vkEnumeratePhysicalDeviceGroupsKHR(VkInstance instance, uint32_t *pPhysicalDeviceGroupCount,
++                                             VkPhysicalDeviceGroupProperties *pPhysicalDeviceGroupProperties)
++   VWL_API_POST
++{
++   return layer::enumerate_physical_device_groups(instance, pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
++}
++
+ VWL_VKAPI_CALL(VkResult)
+ wsi_layer_vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCreateInfo,
+                          const VkAllocationCallbacks *pAllocator, VkDevice *pDevice) VWL_API_POST
+@@ -668,6 +884,8 @@ wsi_layer_vkGetInstanceProcAddr(VkInstance instance, const char *funcName) VWL_A
+    GET_PROC_ADDR(vkGetDeviceProcAddr);
+    GET_PROC_ADDR(vkGetInstanceProcAddr);
+    GET_PROC_ADDR(vkEnumeratePhysicalDevices);
++   GET_PROC_ADDR(vkEnumeratePhysicalDeviceGroups);
++   GET_PROC_ADDR(vkEnumeratePhysicalDeviceGroupsKHR);
+    GET_PROC_ADDR(vkCreateInstance);
+    GET_PROC_ADDR(vkDestroyInstance);
+    GET_PROC_ADDR(vkCreateDevice);
+diff --git a/layer/private_data.cpp b/layer/private_data.cpp
+index a0601b5..678332f 100644
+--- a/layer/private_data.cpp
++++ b/layer/private_data.cpp
+@@ -400,7 +400,7 @@ bool instance_private_data::has_image_compression_support(VkPhysicalDevice phys_
+ bool instance_private_data::has_frame_boundary_support(VkPhysicalDevice phys_dev)
+ {
+    VkPhysicalDeviceFrameBoundaryFeaturesEXT frame_boundary = {
+-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_COMPRESSION_CONTROL_FEATURES_EXT, nullptr, VK_FALSE
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAME_BOUNDARY_FEATURES_EXT, nullptr, VK_FALSE
+    };
+    VkPhysicalDeviceFeatures2KHR features = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR, &frame_boundary, {} };
+ 
+diff --git a/layer/private_data.hpp b/layer/private_data.hpp
+index c2de3c8..edcbb7c 100644
+--- a/layer/private_data.hpp
++++ b/layer/private_data.hpp
+@@ -221,7 +221,7 @@ static constexpr uint32_t API_VERSION_MAX = UINT32_MAX;
+    /* Vulkan 1.0 */                                                                                                       \
+    EP(GetInstanceProcAddr, "", VK_API_VERSION_1_0, true, )                                                                \
+    EP(DestroyInstance, "", VK_API_VERSION_1_0, true, )                                                                    \
+-   EP(EnumeratePhysicalDevices, "", VK_API_VERSION_1_0, true, )                                                             \
++   EP(EnumeratePhysicalDevices, "", VK_API_VERSION_1_0, true, )                                                           \
+    EP(GetPhysicalDeviceProperties, "", VK_API_VERSION_1_0, true, )                                                        \
+    EP(GetPhysicalDeviceImageFormatProperties, "", VK_API_VERSION_1_0, true, )                                             \
+    EP(EnumerateDeviceExtensionProperties, "", VK_API_VERSION_1_0, true, )                                                 \
+@@ -236,11 +236,11 @@ static constexpr uint32_t API_VERSION_MAX = UINT32_MAX;
+    /* VK_KHR_wayland_surface */                                                                                           \
+    EP(CreateWaylandSurfaceKHR, VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )                           \
+    /* VK_KHR_xcb_surface */                                                                                               \
+-   EP(CreateXcbSurfaceKHR, VK_KHR_XCB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )                                     \
+-   EP(GetPhysicalDeviceXcbPresentationSupportKHR, VK_KHR_XCB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )              \
++   EP(CreateXcbSurfaceKHR, VK_KHR_XCB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )                                   \
++   EP(GetPhysicalDeviceXcbPresentationSupportKHR, VK_KHR_XCB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )            \
+    /* VK_KHR_xlib_surface */                                                                                              \
+-   EP(CreateXlibSurfaceKHR, VK_KHR_XLIB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )                                   \
+-   EP(GetPhysicalDeviceXlibPresentationSupportKHR, VK_KHR_XLIB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )            \
++   EP(CreateXlibSurfaceKHR, VK_KHR_XLIB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )                                 \
++   EP(GetPhysicalDeviceXlibPresentationSupportKHR, VK_KHR_XLIB_SURFACE_EXTENSION_NAME, API_VERSION_MAX, false, )          \
+    /* VK_KHR_display */                                                                                                   \
+    EP(CreateDisplayPlaneSurfaceKHR, VK_KHR_DISPLAY_EXTENSION_NAME, API_VERSION_MAX, false, )                              \
+    /* VK_KHR_get_surface_capabilities2 */                                                                                 \
+@@ -263,6 +263,9 @@ static constexpr uint32_t API_VERSION_MAX = UINT32_MAX;
+       VK_API_VERSION_1_1, false, GetPhysicalDeviceMemoryProperties2)                                                      \
+    EP(GetPhysicalDeviceSparseImageFormatProperties2KHR, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,           \
+       VK_API_VERSION_1_1, false, GetPhysicalDeviceSparseImageFormatProperties2)                                           \
++   /* VK_KHR_device_group_creation or 1.1 (without KHR suffix). Filtered together with vkEnumeratePhysicalDevices. */     \
++   EP(EnumeratePhysicalDeviceGroupsKHR, VK_KHR_DEVICE_GROUP_CREATION_EXTENSION_NAME, VK_API_VERSION_1_1, false,           \
++      EnumeratePhysicalDeviceGroups)                                                                                      \
+    /* VK_KHR_device_group + VK_KHR_surface or */                                                                          \
+    /* 1.1 with VK_KHR_swapchain */                                                                                        \
+    EP(GetPhysicalDevicePresentRectanglesKHR, VK_KHR_DEVICE_GROUP_EXTENSION_NAME, VK_API_VERSION_1_1, false, )             \
+diff --git a/layer/surface_api.cpp b/layer/surface_api.cpp
+index c9793f4..5d1bafb 100644
+--- a/layer/surface_api.cpp
++++ b/layer/surface_api.cpp
+@@ -155,7 +155,9 @@ wsi_layer_vkGetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice physicalDevice,
+    auto &instance = layer::instance_private_data::get(physicalDevice);
+    if (instance.should_layer_handle_surface(physicalDevice, surface))
+    {
+-      *pSupported = VK_TRUE;
++      /* Only devices exposing the extensions required by the layer can present on its surfaces. */
++      *pSupported =
++         wsi::is_physical_device_wsi_capable(physicalDevice, instance.get_enabled_platforms()) ? VK_TRUE : VK_FALSE;
+       return VK_SUCCESS;
+    }
+ 
+diff --git a/packaging/build-deb.sh b/packaging/build-deb.sh
+new file mode 100755
+index 0000000..197febb
+--- /dev/null
++++ b/packaging/build-deb.sh
+@@ -0,0 +1,358 @@
++#!/usr/bin/env bash
++# SPDX-License-Identifier: MIT
++#
++# Build a Debian package of the Vulkan WSI layer.
++#
++# Target: Orange Pi 6 Plus (CIX CD8180 / Sky1, Mali-G720-Immortalis, Arm DDK), Ubuntu 26.04 LTS arm64.
++# The script also works on any Debian/Ubuntu host for its native architecture.
++#
++# Usage: packaging/build-deb.sh [options]
++#
++#   --version VER         Upstream version (default: derived from git, e.g. 0~git20260615.37817c0)
++#   --revision REV        Debian revision (default: 1)
++#   --maintainer "N <m>"  Maintainer field (default: from git config, or a placeholder)
++#   --output DIR          Where to write the .deb (default: <repo>/dist)
++#   --build-dir DIR       Build directory (default: <repo>/build-deb)
++#   --jobs N              Parallel jobs (default: nproc)
++#   --vulkan-headers DIR  Use these Vulkan headers instead of the system ones (directory containing vulkan/)
++#   --heap NAME           Preferred DMA-BUF heap (default: linux,cma; the layer also tries
++#                         default_cma_region and reserved, then falls back to "system")
++#   --no-xcb              Do not build the X11 (XCB/Xlib) backend
++#   --no-wayland          Do not build the Wayland backend
++#   --with-display        Also build the VK_KHR_display (DRM/KMS) backend
++#   --explicit            Install the manifest as an explicit layer (not loaded automatically)
++#   --no-strip            Keep debug symbols in the library
++#   --install-deps        Install the build dependencies with apt-get (uses sudo when not root)
++#   -h, --help            Show this help
++#
++# The resulting package installs:
++#   /usr/lib/<multiarch>/libVkLayer_window_system_integration.so
++#   /usr/share/vulkan/implicit_layer.d/VkLayer_window_system_integration.json
++#
++# At run time the layer can be disabled with DISABLE_WSI_LAYER=1.
++
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
++
++PKG_NAME="vulkan-wsi-layer"
++VERSION=""
++REVISION="1"
++MAINTAINER=""
++OUTPUT_DIR="${SRC_DIR}/dist"
++BUILD_DIR="${SRC_DIR}/build-deb"
++JOBS="$(nproc 2>/dev/null || echo 4)"
++VULKAN_HEADERS=""
++HEAP_NAME="linux,cma"
++WITH_XCB=ON
++WITH_WAYLAND=ON
++WITH_DISPLAY=OFF
++IMPLICIT=ON
++STRIP=1
++INSTALL_DEPS=0
++
++BUILD_DEPS=(
++   build-essential cmake ninja-build pkg-config file dpkg-dev
++   libvulkan-dev linux-libc-dev libdrm-dev
++   libwayland-dev libwayland-bin wayland-protocols
++   libx11-dev libx11-xcb-dev libxcb1-dev libxcb-dri3-dev libxcb-present-dev libxcb-sync-dev libxshmfence-dev
++)
++
++log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
++warn() { printf '\033[1;33mWARNING:\033[0m %s\n' "$*" >&2; }
++die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
++usage() { awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "${BASH_SOURCE[0]}"; exit "${1:-0}"; }
++
++while [[ $# -gt 0 ]]; do
++   case "$1" in
++      --version) VERSION="$2"; shift 2 ;;
++      --revision) REVISION="$2"; shift 2 ;;
++      --maintainer) MAINTAINER="$2"; shift 2 ;;
++      --output) OUTPUT_DIR="$2"; shift 2 ;;
++      --build-dir) BUILD_DIR="$2"; shift 2 ;;
++      --jobs) JOBS="$2"; shift 2 ;;
++      --vulkan-headers) VULKAN_HEADERS="$2"; shift 2 ;;
++      --heap) HEAP_NAME="$2"; shift 2 ;;
++      --no-xcb) WITH_XCB=OFF; shift ;;
++      --no-wayland) WITH_WAYLAND=OFF; shift ;;
++      --with-display) WITH_DISPLAY=ON; shift ;;
++      --explicit) IMPLICIT=OFF; shift ;;
++      --no-strip) STRIP=0; shift ;;
++      --install-deps) INSTALL_DEPS=1; shift ;;
++      -h|--help) usage 0 ;;
++      *) warn "Unknown option: $1"; usage 1 ;;
++   esac
++done
++
++# ---------------------------------------------------------------------------------------------------------------------
++# Dependencies
++# ---------------------------------------------------------------------------------------------------------------------
++if [[ ${INSTALL_DEPS} -eq 1 ]]; then
++   SUDO=""
++   [[ ${EUID} -ne 0 ]] && SUDO="sudo"
++   log "Installing build dependencies"
++   ${SUDO} apt-get update
++   ${SUDO} env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${BUILD_DEPS[@]}"
++fi
++
++missing=()
++for tool in cmake pkg-config dpkg-deb dpkg-architecture dpkg-shlibdeps file strip; do
++   command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
++done
++[[ ${#missing[@]} -eq 0 ]] || die "Missing tools: ${missing[*]} (run with --install-deps)"
++
++pc_modules=(libdrm)
++[[ ${WITH_WAYLAND} == ON ]] && pc_modules+=(wayland-client wayland-protocols)
++[[ ${WITH_XCB} == ON ]] && pc_modules+=(xcb xcb-dri3 xcb-present xcb-sync xshmfence x11-xcb)
++[[ -z ${VULKAN_HEADERS} ]] && pc_modules+=(vulkan)
++for module in "${pc_modules[@]}"; do
++   pkg-config --exists "${module}" || die "pkg-config module '${module}' not found (run with --install-deps)"
++done
++[[ -f /usr/include/linux/dma-heap.h ]] || die "linux/dma-heap.h not found (install linux-libc-dev)"
++
++# Vulkan header version check (the layer is validated against >= 1.4.299).
++if [[ -n ${VULKAN_HEADERS} ]]; then
++   VK_CORE_H="${VULKAN_HEADERS}/vulkan/vulkan_core.h"
++else
++   VK_CORE_H="$(pkg-config --variable=includedir vulkan)/vulkan/vulkan_core.h"
++fi
++[[ -f ${VK_CORE_H} ]] || die "vulkan_core.h not found (${VK_CORE_H})"
++VK_HEADER_VERSION="$(sed -n 's/^#define VK_HEADER_VERSION \([0-9]\+\).*/\1/p' "${VK_CORE_H}" | head -n1)"
++log "Vulkan headers: 1.x.${VK_HEADER_VERSION} (${VK_CORE_H})"
++if [[ -n ${VK_HEADER_VERSION} && ${VK_HEADER_VERSION} -lt 299 ]]; then
++   warn "Vulkan headers older than 1.4.299, the build may fail. Use --vulkan-headers or Ubuntu >= 25.04."
++fi
++
++# ---------------------------------------------------------------------------------------------------------------------
++# Package metadata
++# ---------------------------------------------------------------------------------------------------------------------
++DEB_ARCH="$(dpkg-architecture -qDEB_HOST_ARCH)"
++MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
++
++if [[ -z ${VERSION} ]]; then
++   if git -C "${SRC_DIR}" rev-parse --git-dir >/dev/null 2>&1; then
++      commit_date="$(git -C "${SRC_DIR}" log -1 --format=%cd --date=format:%Y%m%d)"
++      commit_sha="$(git -C "${SRC_DIR}" rev-parse --short=7 HEAD)"
++      VERSION="0~git${commit_date}.${commit_sha}"
++      if ! git -C "${SRC_DIR}" diff --quiet HEAD -- 2>/dev/null; then
++         VERSION="${VERSION}+local"
++      fi
++   else
++      VERSION="0~$(date +%Y%m%d)"
++   fi
++fi
++[[ ${VERSION} =~ ^[0-9][A-Za-z0-9.+~]*$ ]] || die "Invalid Debian version: ${VERSION}"
++FULL_VERSION="${VERSION}-${REVISION}"
++
++if [[ -z ${MAINTAINER} ]]; then
++   git_name="$(git -C "${SRC_DIR}" config user.name 2>/dev/null || true)"
++   git_mail="$(git -C "${SRC_DIR}" config user.email 2>/dev/null || true)"
++   if [[ -n ${git_name} && -n ${git_mail} ]]; then
++      MAINTAINER="${git_name} <${git_mail}>"
++   else
++      MAINTAINER="Local Build <root@localhost>"
++   fi
++fi
++
++if [[ ${IMPLICIT} == ON ]]; then
++   MANIFEST_DIR="usr/share/vulkan/implicit_layer.d"
++else
++   MANIFEST_DIR="usr/share/vulkan/explicit_layer.d"
++fi
++
++log "Package ${PKG_NAME} ${FULL_VERSION} (${DEB_ARCH}, ${MULTIARCH})"
++log "Backends: headless=ON wayland=${WITH_WAYLAND} xcb=${WITH_XCB} display=${WITH_DISPLAY}, heap=${HEAP_NAME}"
++
++# ---------------------------------------------------------------------------------------------------------------------
++# Build
++# ---------------------------------------------------------------------------------------------------------------------
++GENERATOR=()
++command -v ninja >/dev/null 2>&1 && GENERATOR=(-G Ninja)
++
++CMAKE_ARGS=(
++   -S "${SRC_DIR}" -B "${BUILD_DIR}" "${GENERATOR[@]}"
++   -DCMAKE_BUILD_TYPE=Release
++   -DCMAKE_INSTALL_PREFIX=/usr
++   -DCMAKE_INSTALL_LIBDIR="lib/${MULTIARCH}"
++   -DBUILD_WSI_HEADLESS=ON
++   -DBUILD_WSI_WAYLAND="${WITH_WAYLAND}"
++   -DBUILD_WSI_XCB="${WITH_XCB}"
++   -DBUILD_WSI_DISPLAY="${WITH_DISPLAY}"
++   -DSELECT_EXTERNAL_ALLOCATOR=dma_buf_heaps
++   -DWSIALLOC_MEMORY_HEAP_NAME="${HEAP_NAME}"
++   -DWSIALLOC_FALLBACK_HEAP_NAME=system
++   -DWSI_LAYER_INSTALL_IMPLICIT="${IMPLICIT}"
++   -DWSI_LAYER_MANIFEST_LIBRARY_PATH=libVkLayer_window_system_integration.so
++   -DVULKAN_WSI_LAYER_EXPERIMENTAL=OFF
++)
++[[ -n ${VULKAN_HEADERS} ]] && CMAKE_ARGS+=(-DVULKAN_CXX_INCLUDE="${VULKAN_HEADERS}")
++
++# Debian hardening flags (bindnow, relro, fortify, stack protector, branch protection on arm64).
++if command -v dpkg-buildflags >/dev/null 2>&1; then
++   export DEB_BUILD_MAINT_OPTIONS="hardening=+all"
++   CMAKE_ARGS+=(
++      -DCMAKE_C_FLAGS="$(dpkg-buildflags --get CFLAGS) $(dpkg-buildflags --get CPPFLAGS)"
++      -DCMAKE_CXX_FLAGS="$(dpkg-buildflags --get CXXFLAGS) $(dpkg-buildflags --get CPPFLAGS)"
++      -DCMAKE_SHARED_LINKER_FLAGS="$(dpkg-buildflags --get LDFLAGS)"
++   )
++fi
++
++log "Configuring"
++rm -rf "${BUILD_DIR}"
++cmake "${CMAKE_ARGS[@]}"
++
++log "Building (${JOBS} jobs)"
++cmake --build "${BUILD_DIR}" --parallel "${JOBS}"
++
++# ---------------------------------------------------------------------------------------------------------------------
++# Staging
++# ---------------------------------------------------------------------------------------------------------------------
++STAGE="$(mktemp -d)"
++trap 'rm -rf "${STAGE}"' EXIT
++PKG_ROOT="${STAGE}/${PKG_NAME}_${FULL_VERSION}_${DEB_ARCH}"
++
++log "Installing into staging area"
++DESTDIR="${PKG_ROOT}" cmake --install "${BUILD_DIR}"
++
++LIB_PATH="${PKG_ROOT}/usr/lib/${MULTIARCH}/libVkLayer_window_system_integration.so"
++MANIFEST_PATH="${PKG_ROOT}/${MANIFEST_DIR}/VkLayer_window_system_integration.json"
++[[ -f ${LIB_PATH} ]] || die "Layer library not installed (${LIB_PATH})"
++[[ -f ${MANIFEST_PATH} ]] || die "Layer manifest not installed (${MANIFEST_PATH})"
++
++# The manifest references the library by file name: the Vulkan loader then resolves it through the dynamic linker
++# search path (/usr/lib/<multiarch>), which keeps the manifest identical across architectures (Multi-Arch: same).
++grep -Eq '"library_path"[[:space:]]*:[[:space:]]*"libVkLayer_window_system_integration\.so"' "${MANIFEST_PATH}" \
++   || die "Unexpected library_path in ${MANIFEST_PATH}"
++
++if [[ ${STRIP} -eq 1 ]]; then
++   strip --strip-unneeded --remove-section=.comment "${LIB_PATH}"
++fi
++chmod 0644 "${LIB_PATH}" "${MANIFEST_PATH}"
++
++# Documentation
++DOC_DIR="${PKG_ROOT}/usr/share/doc/${PKG_NAME}"
++install -d -m 0755 "${DOC_DIR}"
++install -m 0644 "${SRC_DIR}/README.md" "${DOC_DIR}/README.md"
++gzip -9n "${DOC_DIR}/README.md"
++
++cat > "${DOC_DIR}/copyright" <<EOF
++Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
++Upstream-Name: vulkan-wsi-layer
++Source: https://github.com/Trak-unixbased/vulkan-wsi-layer
++ (fork of https://gitlab.freedesktop.org/mesa/vulkan-wsi-layer)
++
++Files: *
++Copyright: 2017-2026 Arm Limited
++License: MIT
++
++Files: wsi/xcb/*
++Copyright: 2026 Cix Technology Group Co., Ltd.
++           2017-2022 Arm Limited
++License: Apache-2.0 and MIT
++
++License: MIT
++$(sed -n '/Permission is hereby granted/,/SOFTWARE\./p' "${SRC_DIR}/LICENSE" | sed 's/^/ /; s/^ $/ ./')
++
++License: Apache-2.0
++ On Debian systems, the full text of the Apache License, Version 2.0 can be found in
++ /usr/share/common-licenses/Apache-2.0.
++EOF
++chmod 0644 "${DOC_DIR}/copyright"
++
++DATE_RFC2822="$(LC_ALL=C date -R)"
++if git -C "${SRC_DIR}" rev-parse --git-dir >/dev/null 2>&1; then
++   DATE_RFC2822="$(LC_ALL=C git -C "${SRC_DIR}" log -1 --format=%cD)"
++fi
++cat > "${DOC_DIR}/changelog.Debian" <<EOF
++${PKG_NAME} (${FULL_VERSION}) unstable; urgency=medium
++
++  * Local build for Orange Pi 6 Plus (CIX CD8180, Mali-G720),
++    Ubuntu 26.04 LTS.
++
++ -- ${MAINTAINER}  ${DATE_RFC2822}
++EOF
++gzip -9n "${DOC_DIR}/changelog.Debian"
++
++# ---------------------------------------------------------------------------------------------------------------------
++# Control files
++# ---------------------------------------------------------------------------------------------------------------------
++log "Computing shared library dependencies"
++SHLIBS_WORK="${STAGE}/shlibs"
++mkdir -p "${SHLIBS_WORK}/debian"
++cat > "${SHLIBS_WORK}/debian/control" <<EOF
++Source: ${PKG_NAME}
++
++Package: ${PKG_NAME}
++Architecture: ${DEB_ARCH}
++EOF
++SHLIBS_DEPENDS="$(cd "${SHLIBS_WORK}" && dpkg-shlibdeps -O -e"${LIB_PATH}" 2>/dev/null | sed -n 's/^shlibs:Depends=//p')"
++[[ -n ${SHLIBS_DEPENDS} ]] || die "dpkg-shlibdeps did not return any dependency"
++
++# The layer is loaded by the Vulkan loader; libvulkan1 is not linked but required at run time.
++DEPENDS="${SHLIBS_DEPENDS}, libvulkan1 (>= 1.3.0)"
++INSTALLED_SIZE="$(du -sk --exclude=DEBIAN "${PKG_ROOT}" | cut -f1)"
++
++install -d -m 0755 "${PKG_ROOT}/DEBIAN"
++cat > "${PKG_ROOT}/DEBIAN/control" <<EOF
++Package: ${PKG_NAME}
++Version: ${FULL_VERSION}
++Architecture: ${DEB_ARCH}
++Maintainer: ${MAINTAINER}
++Installed-Size: ${INSTALLED_SIZE}
++Depends: ${DEPENDS}
++Section: libs
++Priority: optional
++Multi-Arch: same
++Homepage: https://gitlab.freedesktop.org/mesa/vulkan-wsi-layer
++Description: Vulkan window system integration layer (Arm Mali / CIX)
++ Vulkan layer implementing VK_KHR_swapchain and the surface extensions
++ (Wayland, X11 XCB/Xlib, headless) for Vulkan drivers that do not provide
++ their own window system integration, such as the Arm Mali DDK shipped for
++ the CIX CD8180 (Sky1) SoC of the Orange Pi 6 Plus.
++ .
++ The layer is installed as an implicit layer and is enabled automatically.
++ Set DISABLE_WSI_LAYER=1 to disable it, WSI_LAYER_DEVICE_FILTER=all to
++ expose non-Mali GPUs, and WSIALLOC_DMA_HEAP to select the DMA-BUF heap.
++EOF
++
++# Shared library in a standard library directory: refresh the ld.so cache.
++echo "activate-noawait ldconfig" > "${PKG_ROOT}/DEBIAN/triggers"
++
++# md5sums of every shipped file
++(cd "${PKG_ROOT}" && find . -path ./DEBIAN -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 md5sum \
++   | sed 's| \./| |') > "${PKG_ROOT}/DEBIAN/md5sums"
++chmod 0644 "${PKG_ROOT}/DEBIAN/control" "${PKG_ROOT}/DEBIAN/md5sums" "${PKG_ROOT}/DEBIAN/triggers"
++
++# Normalise permissions (umask independent).
++find "${PKG_ROOT}" -type d -exec chmod 0755 {} +
++
++# ---------------------------------------------------------------------------------------------------------------------
++# Build the package
++# ---------------------------------------------------------------------------------------------------------------------
++mkdir -p "${OUTPUT_DIR}"
++DEB_FILE="${OUTPUT_DIR}/${PKG_NAME}_${FULL_VERSION}_${DEB_ARCH}.deb"
++log "Building ${DEB_FILE}"
++dpkg-deb --root-owner-group -Zxz --build "${PKG_ROOT}" "${DEB_FILE}" >/dev/null
++
++if command -v lintian >/dev/null 2>&1; then
++   log "lintian (informative)"
++   lintian --no-tag-display-limit --suppress-tags no-manual-page,initial-upload-closes-no-bugs,package-name-doesnt-match-sonames,shared-library-lacks-version \
++      "${DEB_FILE}" || true
++fi
++
++log "Contents"
++dpkg-deb --info "${DEB_FILE}" | sed -n '/Package:/,$p'
++dpkg-deb --contents "${DEB_FILE}"
++
++cat <<EOF
++
++Package ready: ${DEB_FILE}
++
++Install on the Orange Pi 6 Plus:
++  sudo apt install ./$(basename "${DEB_FILE}")
++
++Check:
++  vulkaninfo --summary          # the layer appears in "Instance Layers"
++  vkcube --wsi wayland          # or: vkcube --wsi xcb (X11 / Xwayland)
++EOF
+diff --git a/util/wsialloc/wsialloc_dma_buf_heaps.c b/util/wsialloc/wsialloc_dma_buf_heaps.c
+index a4c88f0..ff62c5e 100644
+--- a/util/wsialloc/wsialloc_dma_buf_heaps.c
++++ b/util/wsialloc/wsialloc_dma_buf_heaps.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2024 Arm Limited.
++ * Copyright (c) 2024, 2026 Arm Limited.
+  *
+  * SPDX-License-Identifier: MIT
+  *
+@@ -22,15 +22,34 @@
+  * SOFTWARE.
+  */
+ 
++/*
++ * DMA-BUF heaps implementation of the wsialloc interface.
++ *
++ * Heap selection (first heap that can be opened wins):
++ *   1. $WSIALLOC_DMA_HEAP                       (runtime override, e.g. "system")
++ *   2. WSIALLOC_MEMORY_HEAP_NAME                (build option, default "linux,cma")
++ *   3. "default_cma_region", "linux,cma", "reserved"
++ *      Recent kernels expose the default CMA area as "default_cma_region" (the legacy name depends on the device
++ *      tree / CONFIG_DMABUF_HEAPS_CMA_LEGACY), so the name chosen at build time may not exist on the target.
++ *
++ * Fallback heap: $WSIALLOC_FALLBACK_DMA_HEAP or WSIALLOC_FALLBACK_HEAP_NAME (default "system", empty disables).
++ * It is used when no preferred heap exists, and per allocation when the preferred heap fails (typically a CMA area
++ * exhausted by several full-resolution swapchains). The Mali GPU and the compositor import through their MMUs, so
++ * non-contiguous "system" buffers stay usable; only direct scanout may then be skipped by the compositor.
++ */
++
+ #include "wsialloc.h"
+ #include "wsialloc_helpers.h"
+ 
+ #include <assert.h>
+ #include <errno.h>
+ #include <fcntl.h>
++#include <limits.h>
+ #include <stdbool.h>
+ #include <stdint.h>
++#include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <sys/ioctl.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+@@ -52,23 +71,88 @@
+ 
+ const uint32_t WSIALLOC_IMPLEMENTATION_VERSION_SYMBOL = WSIALLOC_IMPLEMENTATION_VERSION;
+ 
+-/* Some string may contain commas, setting the macro as variadic */
+-#define STR_EXPAND(tok...) #tok
+-#define STR(tok) STR_EXPAND(tok)
++#ifndef WSIALLOC_MEMORY_HEAP_NAME
++#define WSIALLOC_MEMORY_HEAP_NAME "linux,cma"
++#endif
++
++#ifndef WSIALLOC_FALLBACK_HEAP_NAME
++#define WSIALLOC_FALLBACK_HEAP_NAME "system"
++#endif
++
++#define DMA_HEAP_DIR "/dev/dma_heap/"
+ 
+ struct wsialloc_allocator
+ {
+-   /* File descriptor for a DMA-BUF heap for allocating memory accessible to
++   /* File descriptor for the preferred DMA-BUF heap for allocating memory accessible to
+     * the windowing system (display, compositor, etc.)
+     */
+    int memory_fd;
+ 
++   /* File descriptor for the fallback DMA-BUF heap, or -1. */
++   int fallback_fd;
++
+    /* File descriptor for a DMA-BUF heap for allocating protected memory
+     * accessible to the windowing system.
+     */
+    int protected_fd;
+ };
+ 
++static int open_heap(const char *name)
++{
++   if (name == NULL || name[0] == '\0' || strchr(name, '/') != NULL)
++   {
++      return -1;
++   }
++
++   char path[PATH_MAX];
++   const int len = snprintf(path, sizeof(path), DMA_HEAP_DIR "%s", name);
++   if (len < 0 || (size_t)len >= sizeof(path))
++   {
++      return -1;
++   }
++
++   /* O_CLOEXEC: the heap must not leak into processes spawned by the application. */
++   return open(path, O_RDONLY | O_CLOEXEC);
++}
++
++static int open_preferred_heap(void)
++{
++   const char *const candidates[] = {
++      getenv("WSIALLOC_DMA_HEAP"), WSIALLOC_MEMORY_HEAP_NAME, "default_cma_region", "linux,cma", "reserved",
++   };
++
++   for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++)
++   {
++      const int fd = open_heap(candidates[i]);
++      if (fd >= 0)
++      {
++         return fd;
++      }
++   }
++   return -1;
++}
++
++static int open_fallback_heap(void)
++{
++   const char *name = getenv("WSIALLOC_FALLBACK_DMA_HEAP");
++   if (name == NULL)
++   {
++      name = WSIALLOC_FALLBACK_HEAP_NAME;
++   }
++   return open_heap(name);
++}
++
++static bool same_heap(int fd_a, int fd_b)
++{
++   struct stat st_a;
++   struct stat st_b;
++   if (fstat(fd_a, &st_a) != 0 || fstat(fd_b, &st_b) != 0)
++   {
++      return false;
++   }
++   return st_a.st_rdev == st_b.st_rdev;
++}
++
+ static int allocate(int fd, uint64_t size)
+ {
+    assert(size > 0);
+@@ -79,13 +163,18 @@ static int allocate(int fd, uint64_t size)
+       .fd_flags = O_RDWR | O_CLOEXEC,
+    };
+ 
+-   int ret = ioctl(fd, DMA_HEAP_IOCTL_ALLOC, &heap_data);
++   int ret;
++   do
++   {
++      ret = ioctl(fd, DMA_HEAP_IOCTL_ALLOC, &heap_data);
++   } while (ret != 0 && errno == EINTR);
++
+    if (ret != 0)
+    {
+       return -errno;
+    }
+    assert(heap_data.fd > 0);
+-   return heap_data.fd;
++   return (int)heap_data.fd;
+ }
+ 
+ static int dma_allocate(const wsialloc_allocator *allocator, const wsialloc_allocate_info *info, uint64_t size)
+@@ -94,20 +183,37 @@ static int dma_allocate(const wsialloc_allocator *allocator, const wsialloc_allo
+    assert(info != NULL);
+    assert(size > 0);
+ 
+-   /* The only error that can be encountered on allocations is lack of resources. Other parameter validation and
+-    * support checks are done on format selection. */
+-   int alloc_fd = allocator->memory_fd;
++   /* Protected memory never falls back to an unprotected heap. */
+    if (info->flags & WSIALLOC_ALLOCATE_PROTECTED)
+    {
+-      alloc_fd = allocator->protected_fd;
++      if (allocator->protected_fd < 0)
++      {
++         return -ENODEV;
++      }
++      return allocate(allocator->protected_fd, size);
+    }
+-   if (alloc_fd < 0)
++
++   int fd = allocate(allocator->memory_fd, size);
++   if (fd < 0 && allocator->fallback_fd >= 0)
+    {
+-      assert(false);
+-      return -1;
++      static bool warned = false;
++      if (!warned)
++      {
++         warned = true;
++         fprintf(stderr, "wsialloc: preferred DMA-BUF heap allocation of %llu bytes failed (%d), using fallback heap\n",
++                 (unsigned long long)size, fd);
++      }
++      fd = allocate(allocator->fallback_fd, size);
+    }
++   return fd;
++}
+ 
+-   return allocate(alloc_fd, size);
++static void close_fd(int fd)
++{
++   if (fd >= 0)
++   {
++      close(fd);
++   }
+ }
+ 
+ wsialloc_error wsialloc_new(wsialloc_allocator **allocator)
+@@ -120,11 +226,25 @@ wsialloc_error wsialloc_new(wsialloc_allocator **allocator)
+       return WSIALLOC_ERROR_NO_RESOURCE;
+    }
+ 
+-   dma_buf_heaps->memory_fd = open("/dev/dma_heap/" STR(WSIALLOC_MEMORY_HEAP_NAME), O_RDWR);
++   dma_buf_heaps->memory_fd = open_preferred_heap();
++   dma_buf_heaps->fallback_fd = open_fallback_heap();
+    dma_buf_heaps->protected_fd = -1;
+ 
+    if (dma_buf_heaps->memory_fd < 0)
+    {
++      /* No CMA-like heap at all: allocate everything from the fallback heap. */
++      dma_buf_heaps->memory_fd = dma_buf_heaps->fallback_fd;
++      dma_buf_heaps->fallback_fd = -1;
++   }
++   else if (dma_buf_heaps->fallback_fd >= 0 && same_heap(dma_buf_heaps->memory_fd, dma_buf_heaps->fallback_fd))
++   {
++      close_fd(dma_buf_heaps->fallback_fd);
++      dma_buf_heaps->fallback_fd = -1;
++   }
++
++   if (dma_buf_heaps->memory_fd < 0)
++   {
++      fprintf(stderr, "wsialloc: no usable DMA-BUF heap found in " DMA_HEAP_DIR "\n");
+       free(dma_buf_heaps);
+       return WSIALLOC_ERROR_NO_RESOURCE;
+    }
+@@ -133,14 +253,6 @@ wsialloc_error wsialloc_new(wsialloc_allocator **allocator)
+    return WSIALLOC_ERROR_NONE;
+ }
+ 
+-static void close_fd(int fd)
+-{
+-   if (fd >= 0)
+-   {
+-      close(fd);
+-   }
+-}
+-
+ void wsialloc_delete(wsialloc_allocator *allocator)
+ {
+    assert(allocator != NULL);
+@@ -150,9 +262,11 @@ void wsialloc_delete(wsialloc_allocator *allocator)
+    }
+ 
+    close_fd(allocator->memory_fd);
++   close_fd(allocator->fallback_fd);
+    close_fd(allocator->protected_fd);
+ 
+    allocator->memory_fd = -1;
++   allocator->fallback_fd = -1;
+    allocator->protected_fd = -1;
+ 
+    free(allocator);
+@@ -161,6 +275,9 @@ void wsialloc_delete(wsialloc_allocator *allocator)
+ wsialloc_error wsialloc_alloc(wsialloc_allocator *allocator, const wsialloc_allocate_info *info,
+                               wsialloc_allocate_result *result)
+ {
++   assert(allocator != NULL);
++   assert(info != NULL);
++
+    int fd_to_use = allocator->memory_fd;
+    if (info->flags & WSIALLOC_ALLOCATE_PROTECTED)
+    {
+diff --git a/util/wsialloc/wsialloc_helpers.c b/util/wsialloc/wsialloc_helpers.c
+index e7b6c54..751f161 100644
+--- a/util/wsialloc/wsialloc_helpers.c
++++ b/util/wsialloc/wsialloc_helpers.c
+@@ -138,8 +138,8 @@ wsialloc_error wsiallocp_alloc(wsialloc_allocator *allocator, wsiallocp_alloc_ca
+       return WSIALLOC_ERROR_INVALID;
+    }
+ 
+-   int local_strides[WSIALLOC_MAX_PLANES];
+-   int local_offsets[WSIALLOC_MAX_PLANES];
++   int local_strides[WSIALLOC_MAX_PLANES] = { 0 };
++   int local_offsets[WSIALLOC_MAX_PLANES] = { 0 };
+    wsialloc_error err = WSIALLOC_ERROR_NONE;
+    wsialloc_format_descriptor selected_format_desc = {};
+ 
+diff --git a/wsi/display/swapchain.cpp b/wsi/display/swapchain.cpp
+index d17d333..4da4f63 100644
+--- a/wsi/display/swapchain.cpp
++++ b/wsi/display/swapchain.cpp
+@@ -150,7 +150,7 @@ VkResult swapchain::get_surface_compatible_formats(const VkImageCreateInfo &info
+ 
+    for (const auto &prop : drm_format_props)
+    {
+-      drm_format_pair drm_format{ util::drm::(info.format), prop.drmFormatModifier };
++      drm_format_pair drm_format{ util::drm::vk_to_drm_format(info.format), prop.drmFormatModifier };
+ 
+       if (!display->is_format_supported(drm_format))
+       {
+diff --git a/wsi/surface_properties.cpp b/wsi/surface_properties.cpp
+index b6876c5..311edfe 100644
+--- a/wsi/surface_properties.cpp
++++ b/wsi/surface_properties.cpp
+@@ -104,9 +104,18 @@ void get_surface_capabilities_common(VkPhysicalDevice physical_device, VkSurface
+    surface_capabilities->currentExtent = { 0xffffffff, 0xffffffff };
+    surface_capabilities->minImageExtent = { 1, 1 };
+ 
+-   // Set maxImageExtent to { 16384, 16384 } instead of querying from mali
+-   // to pass dEQP-VK.wsi.wayland.swapchain.create.image_extent
+-   surface_capabilities->maxImageExtent = { 16384, 16384 };
++   /* The Mali driver reports a maxImageDimension2D (65536) far beyond what the display/compositor path can
++    * allocate, which makes dEQP-VK.wsi.*.swapchain.create.image_extent fail. Clamp to 16384, but never report more
++    * than the device actually supports. */
++   constexpr uint32_t max_presentable_extent = 16384;
++   VkPhysicalDeviceProperties dev_props = {};
++   layer::instance_private_data::get(physical_device).disp.GetPhysicalDeviceProperties(physical_device, &dev_props);
++   uint32_t max_extent = max_presentable_extent;
++   if (dev_props.limits.maxImageDimension2D != 0 && dev_props.limits.maxImageDimension2D < max_extent)
++   {
++      max_extent = dev_props.limits.maxImageDimension2D;
++   }
++   surface_capabilities->maxImageExtent = { max_extent, max_extent };
+ 
+    surface_capabilities->maxImageArrayLayers = 1;
+ 
+diff --git a/wsi/swapchain_base.cpp b/wsi/swapchain_base.cpp
+index 17e72b2..7188e7d 100644
+--- a/wsi/swapchain_base.cpp
++++ b/wsi/swapchain_base.cpp
+@@ -58,12 +58,11 @@ void swapchain_base::page_flip_thread()
+    auto &sc_images = m_swapchain_images;
+    VkResult vk_res = VK_SUCCESS;
+    uint64_t timeout = UINT64_MAX;
++   /* Short enough for update_pending_image_status() to keep backends that poll for released images responsive. */
++   constexpr uint64_t SEMAPHORE_TIMEOUT = 100000000; /* 100 ms. */
+ 
+-   /* No mutex is needed for the accesses to m_page_flip_thread_run variable as after the variable is
+-    * initialized it is only ever changed to false. The while loop will make the thread read the
+-    * value repeatedly, and the combination of semaphores and thread joins will force any changes to
+-    * the variable to be visible to this thread.
+-    */
++   /* m_page_flip_thread_run is atomic: it is cleared by teardown() on the application thread while this thread
++    * keeps reading it. A plain bool was a data race (undefined behaviour, reported by ThreadSanitizer). */
+    while (m_page_flip_thread_run)
+    {
+       pending_present_request submit_info{};
+@@ -75,7 +74,7 @@ void swapchain_base::page_flip_thread()
+          {
+             vk_res = VK_SUCCESS;
+          }
+-         else if ((vk_res = m_page_flip_semaphore.wait(100000000)) == VK_TIMEOUT)
++         else if ((vk_res = m_page_flip_semaphore.wait(SEMAPHORE_TIMEOUT)) == VK_TIMEOUT)
+          {
+             /* Image is not ready yet. */
+             continue;
+@@ -90,7 +89,7 @@ void swapchain_base::page_flip_thread()
+       {
+          /* Waiting for the page_flip_semaphore which will be signalled once there is an
+           * image to display.*/
+-         if ((vk_res = m_page_flip_semaphore.wait(100000000)) == VK_TIMEOUT)
++         if ((vk_res = m_page_flip_semaphore.wait(SEMAPHORE_TIMEOUT)) == VK_TIMEOUT)
+          {
+             /* Image is not ready yet. */
+             update_pending_image_status();
+@@ -692,6 +691,8 @@ VkResult swapchain_base::queue_present(VkQueue queue, const VkPresentInfoKHR *pr
+ 
+ void swapchain_base::deprecate(VkSwapchainKHR descendant)
+ {
++   /* The page flip thread of this (old) swapchain may still be updating image states. */
++   std::unique_lock<std::recursive_mutex> image_status_lock(m_image_status_mutex);
+    for (auto &img : m_swapchain_images)
+    {
+       if (img.status == swapchain_image::FREE)
+@@ -730,13 +731,35 @@ void swapchain_base::wait_for_pending_buffers()
+    wait = static_cast<int>(m_swapchain_images.size()) - acquired_images - invalid_image - 1;
+    image_status_lock.unlock();
+ 
++   /* Poll every 100 ms so that backends which only learn about released images on demand (X11 Present) get a
++    * chance to process their events. Give up after WAIT_PENDING_MAX_POLLS consecutive timeouts or on error: a
++    * compositor that never releases a buffer (window destroyed, compositor crash) must not hang vkDestroySwapchainKHR
++    * forever. Destroying the images afterwards is safe as the window system holds its own reference to the dma-buf. */
++   constexpr uint64_t WAIT_PENDING_POLL_NS = 100000000; /* 100 ms */
++   constexpr uint32_t WAIT_PENDING_MAX_POLLS = 20;      /* 2 s */
++   uint32_t consecutive_timeouts = 0;
+    while (wait > 0)
+    {
+       /* Take down one free image semaphore. */
+-      // Check every 0.1ms to see if compositor free the pending images.
+-      if (wait_for_free_buffer(100000000) == VK_SUCCESS)
++      const VkResult res = wait_for_free_buffer(WAIT_PENDING_POLL_NS);
++      if (res == VK_SUCCESS)
+       {
+          --wait;
++         consecutive_timeouts = 0;
++         continue;
++      }
++
++      if (res != VK_TIMEOUT && res != VK_NOT_READY)
++      {
++         WSI_LOG_WARNING("Stopped waiting for pending buffers (error %d).", static_cast<int>(res));
++         break;
++      }
++
++      update_pending_image_status();
++      if (error_has_occured() || ++consecutive_timeouts >= WAIT_PENDING_MAX_POLLS)
++      {
++         WSI_LOG_WARNING("Presentation engine did not release %d pending buffer(s), continuing.", wait);
++         break;
+       }
+    }
+ }
+diff --git a/wsi/swapchain_base.hpp b/wsi/swapchain_base.hpp
+index b9d1ba9..09ecb5d 100644
+--- a/wsi/swapchain_base.hpp
++++ b/wsi/swapchain_base.hpp
+@@ -35,6 +35,7 @@
+ #include <vulkan/vulkan.h>
+ #include <thread>
+ #include <array>
++#include <atomic>
+ 
+ #include <util/custom_allocator.hpp>
+ #include <util/helpers.hpp>
+@@ -314,8 +315,10 @@ protected:
+ 
+    /**
+     * @brief Whether the page flip thread has to continue running or terminate.
++    *
++    * Written by the application thread (teardown) while the page flip thread reads it: must be atomic.
+     */
+-   bool m_page_flip_thread_run;
++   std::atomic<bool> m_page_flip_thread_run;
+ 
+    /**
+     * @brief A semaphore to be signalled once a page flip event occurs.
+@@ -559,14 +562,16 @@ protected:
+       return VK_SUCCESS;
+    }
+ 
+-    /**
+-    * @brief update pending image status if it is freed by the compositor
+-
+-    *
+-    * Check to the compositor if the pending image is released to the drvier.
++   /**
++    * @brief Poll the presentation engine for images it has released.
+     *
++    * Called periodically by the page flip thread and while waiting for pending buffers, so that backends whose
++    * release notifications are only processed on demand (e.g. X11 Present IdleNotify events) can return images to
++    * the FREE state. Must not block. The default implementation does nothing.
+     */
+-   virtual void update_pending_image_status() {};
++   virtual void update_pending_image_status()
++   {
++   }
+ 
+    /**
+     * @brief Sets the present payload for a swapchain image.
+@@ -603,12 +608,13 @@ protected:
+    {
+       /* VK_SUBOPTIMAL_KHR is a success code, not an error. The swapchain can
+        * still acquire/present images while reporting suboptimal to the app. */
+-      return m_error_state != VK_SUCCESS && m_error_state != VK_SUBOPTIMAL_KHR;
++      const VkResult state = m_error_state.load(std::memory_order_acquire);
++      return state != VK_SUCCESS && state != VK_SUBOPTIMAL_KHR;
+    }
+ 
+    VkResult get_error_state() const
+    {
+-      return m_error_state;
++      return m_error_state.load(std::memory_order_acquire);
+    }
+ 
+    /*
+@@ -617,11 +623,21 @@ protected:
+     * The error state should be set when a failure that should be communicated
+     * to the application occurs during the page flipping thread.
+     *
++    * The state is shared between the application threads and the page flip thread, hence the atomic.
++    * VK_SUBOPTIMAL_KHR is only a hint: it is recorded only while no other state is set, so that it can never
++    * hide a real error (e.g. an X11 ConfigureNotify reporting both a destroyed window and a size change).
++    *
+     * @param state Error code to be returned from acquire_next_image.
+     */
+    void set_error_state(VkResult state)
+    {
+-      m_error_state = state;
++      if (state == VK_SUBOPTIMAL_KHR)
++      {
++         VkResult expected = VK_SUCCESS;
++         m_error_state.compare_exchange_strong(expected, state, std::memory_order_acq_rel);
++         return;
++      }
++      m_error_state.store(state, std::memory_order_release);
+    }
+ 
+ private:
+@@ -633,7 +649,7 @@ private:
+     * appropriate error code and it is returned to the user through the next
+     * acquire_next_image call.
+     */
+-   VkResult m_error_state;
++   std::atomic<VkResult> m_error_state;
+ 
+    /**
+     * @brief Wait for a buffer to become free.
+diff --git a/wsi/unsupported_surfaces.hpp b/wsi/unsupported_surfaces.hpp
+index 20d7d1a..45ba536 100644
+--- a/wsi/unsupported_surfaces.hpp
++++ b/wsi/unsupported_surfaces.hpp
+@@ -42,8 +42,15 @@ namespace wsi
+ {
+ /* A list of platform-specific unsupported surface extensions
+    Not using the extension macros and symbols due to missing definitions for native platform symbols. */
++#if BUILD_WSI_XCB
++/* VK_KHR_xcb_surface and VK_KHR_xlib_surface are implemented by the XCB backend: listing them here disabled
++ * VK_EXT_swapchain_maintenance1 for every application that merely enabled an X11 surface extension. */
++static constexpr std::array unsupported_surfaces_ext_array = { "VK_KHR_win32_surface", "VK_EXT_metal_surface",
++                                                               "VK_KHR_android_surface" };
++#else
+ static constexpr std::array unsupported_surfaces_ext_array = { "VK_KHR_win32_surface", "VK_KHR_xlib_surface",
+                                                                "VK_KHR_xcb_surface", "VK_EXT_metal_surface",
+                                                                "VK_KHR_android_surface" };
++#endif
+ 
+ } // namespace wsi
+diff --git a/wsi/wayland/surface_properties.cpp b/wsi/wayland/surface_properties.cpp
+index 3691185..a894d44 100644
+--- a/wsi/wayland/surface_properties.cpp
++++ b/wsi/wayland/surface_properties.cpp
+@@ -37,6 +37,7 @@
+ #include <array>
+ #include <cstring>
+ #include "surface_properties.hpp"
++#include "wsi/wsi_factory.hpp"
+ #include "surface.hpp"
+ #include "layer/private_data.hpp"
+ #include "wl_helpers.hpp"
+@@ -349,13 +350,18 @@ GetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice physical_device,
+                                                struct wl_display *display)
+ {
+    UNUSED(queue_index);
+-   bool dev_supports_sync =
+-      sync_fd_fence_sync::is_supported(layer::instance_private_data::get(physical_device), physical_device);
++   auto &instance_data = layer::instance_private_data::get(physical_device);
++   bool dev_supports_sync = sync_fd_fence_sync::is_supported(instance_data, physical_device);
+    if (!dev_supports_sync)
+    {
+       return VK_FALSE;
+    }
+ 
++   if (!wsi::is_physical_device_wsi_capable(physical_device, instance_data.get_enabled_platforms()))
++   {
++      return VK_FALSE;
++   }
++
+    if (!check_wl_protocols(display))
+    {
+       return VK_FALSE;
+diff --git a/wsi/wayland/swapchain.cpp b/wsi/wayland/swapchain.cpp
+index 7924e3e..2478834 100644
+--- a/wsi/wayland/swapchain.cpp
++++ b/wsi/wayland/swapchain.cpp
+@@ -717,7 +717,13 @@ VkResult swapchain::image_set_present_payload(swapchain_image &image, VkQueue qu
+ 
+ VkResult swapchain::image_wait_present(swapchain_image &image, uint64_t timeout)
+ {
+-#if !SUPPORT_EXPLICIT_SYNC
++#if SUPPORT_EXPLICIT_SYNC
++   /* With explicit sync the acquire fence is handed to the compositor, there is nothing to wait for here. */
++   UNUSED(image);
++   UNUSED(timeout);
++   return VK_SUCCESS;
++#else
++   /* Implicit sync: make sure rendering is complete before the buffer is attached to the surface. */
+    auto image_data = reinterpret_cast<wayland_image_data *>(image.data);
+    return image_data->present_fence.wait_payload(timeout);
+ #endif
+diff --git a/wsi/wayland/wp_presentation_feedback.hpp b/wsi/wayland/wp_presentation_feedback.hpp
+index 67b816e..fb6470c 100644
+--- a/wsi/wayland/wp_presentation_feedback.hpp
++++ b/wsi/wayland/wp_presentation_feedback.hpp
+@@ -89,6 +89,7 @@ public:
+       m_feedback = std::move(feedback_obj.m_feedback);
+       m_ext = feedback_obj.m_ext;
+       feedback_obj.reset();
++      return *this;
+    }
+ 
+    void reset()
+diff --git a/wsi/wsi_factory.cpp b/wsi/wsi_factory.cpp
+index 43ac950..d87f982 100644
+--- a/wsi/wsi_factory.cpp
++++ b/wsi/wsi_factory.cpp
+@@ -218,12 +218,15 @@ VkResult add_device_extensions_required_by_layer(VkPhysicalDevice phys_dev,
+       bool supported = available_device_extensions.contains(extensions_required_by_layer);
+       if (!supported)
+       {
+-         /* Can we accept failure? The layer unconditionally advertises support for this platform and the loader uses
+-          * this information to enable its own support of the vkCreate*SurfaceKHR entrypoints. The rest of the Vulkan
+-          * stack may not support this extension so we cannot blindly fall back to it.
+-          * For now treat this as an error.
+-          */
+-         return VK_ERROR_INITIALIZATION_FAILED;
++         /* The device (e.g. llvmpipe next to the Mali DDK) cannot be driven by the layer for this platform.
++          * Failing vkCreateDevice here made every Vulkan application (vulkaninfo, compute-only programs...) fail on
++          * such devices. Create the device without the layer's extensions instead:
++          * is_physical_device_wsi_capable() reports the device as unable to present on layer-owned surfaces, so a
++          * conformant application never creates a swapchain with it. */
++         WSI_LOG_WARNING("Physical device lacks the extensions required by the WSI layer for platform %d, "
++                         "presentation through the layer is disabled for it.",
++                         static_cast<int>(wsi_ext.platform));
++         continue;
+       }
+ 
+       TRY_LOG_CALL(extensions_to_enable.add(extensions_required_by_layer));
+@@ -232,6 +235,34 @@ VkResult add_device_extensions_required_by_layer(VkPhysicalDevice phys_dev,
+    return VK_SUCCESS;
+ }
+ 
++bool is_physical_device_wsi_capable(VkPhysicalDevice phys_dev, const util::wsi_platform_set &enabled_platforms)
++{
++   util::allocator allocator{ layer::instance_private_data::get(phys_dev).get_allocator(),
++                              VK_SYSTEM_ALLOCATION_SCOPE_COMMAND };
++   util::extension_list available_device_extensions{ allocator };
++   if (get_available_device_extensions(phys_dev, available_device_extensions) != VK_SUCCESS)
++   {
++      return false;
++   }
++
++   for (const auto &wsi_ext : supported_wsi_extensions)
++   {
++      if (!enabled_platforms.contains(wsi_ext.platform))
++      {
++         continue;
++      }
++
++      surface_properties *props = get_surface_properties(wsi_ext.platform);
++      util::extension_list extensions_required_by_layer{ allocator };
++      if (props == nullptr || props->get_required_device_extensions(extensions_required_by_layer) != VK_SUCCESS ||
++          !available_device_extensions.contains(extensions_required_by_layer))
++      {
++         return false;
++      }
++   }
++   return true;
++}
++
+ VkResult add_instance_extensions_required_by_layer(const util::wsi_platform_set enabled_platforms,
+                                                    util::extension_list &extensions_to_enable)
+ {
+diff --git a/wsi/wsi_factory.hpp b/wsi/wsi_factory.hpp
+index c76e076..2dd1a7a 100644
+--- a/wsi/wsi_factory.hpp
++++ b/wsi/wsi_factory.hpp
+@@ -83,6 +83,16 @@ void destroy_surface_swapchain(swapchain_base *swapchain, layer::device_private_
+  */
+ util::wsi_platform_set find_enabled_layer_platforms(const VkInstanceCreateInfo *pCreateInfo);
+ 
++/**
++ * @brief Check whether the layer can present with @p phys_dev on all the @p enabled_platforms.
++ *
++ * @param[in] phys_dev          The physical device to check.
++ * @param[in] enabled_platforms The platforms enabled in the instance.
++ *
++ * @return true if the device supports every device extension the layer requires for these platforms.
++ */
++bool is_physical_device_wsi_capable(VkPhysicalDevice phys_dev, const util::wsi_platform_set &enabled_platforms);
++
+ /**
+  * @brief Add extra extensions that the layer requires to support the specified list of enabled platforms.
+  *
+diff --git a/wsi/xcb/surface.cpp b/wsi/xcb/surface.cpp
+index c48496a..9d7758d 100644
+--- a/wsi/xcb/surface.cpp
++++ b/wsi/xcb/surface.cpp
+@@ -42,160 +42,137 @@
+  * @brief Implementation of a Xcb WSI Surface
+  */
+ 
+-#define VK_USE_PLATFORM_XCB_KHR 1
+-#define VK_USE_PLATFORM_XLIB_KHR 1
+-
++#include <cstdlib>
++#include <cstring>
+ 
+-#include <X11/Xlib-xcb.h>
+ #include <xcb/xcb.h>
+ #include <xcb/dri3.h>
+-#include <xcb/present.h>
+-#include <xcb/shm.h>
+-extern "C" {
+-#include <X11/xshmfence.h>
+-}
++
++#include <drm_fourcc.h>
++
+ #include "surface.hpp"
+ #include "swapchain.hpp"
+ #include "surface_properties.hpp"
+ 
+ #include "util/log.hpp"
+-#include <cstring>
+ 
+ namespace wsi
+ {
+ namespace xcb
+ {
+ 
+-struct formats_vector
+-{
+-   util::vector<drm_format_pair> *formats{ nullptr };
+-   bool is_out_of_memory{ false };
+-};
+-
+ struct surface::init_parameters
+ {
+    const util::allocator &allocator;
+-   xcb_connection_t      *connection;
+-   xcb_window_t           window;
++   xcb_connection_t *connection;
++   xcb_window_t window;
+ };
+ 
+-uint32_t drm_format_for_depth(uint32_t depth, uint32_t bpp)
++/**
++ * @brief DRM fourcc used for pixmaps of a window of the given depth.
++ *
++ * X only cares about depth/bpp; the fourcc is what the Vulkan side allocates and imports. Depth 24 and 32 windows
++ * both use 32 bpp B8G8R8A8-ordered pixmaps: the X server simply ignores the top byte at depth 24.
++ * The previous implementation switched on the bpp (always 32) and therefore ignored the depth entirely.
++ */
++static uint32_t drm_format_for_depth(uint32_t depth)
+ {
+-   switch (bpp)
++   switch (depth)
+    {
+    case 16:
+       return DRM_FORMAT_RGB565;
+    case 24:
+-      return DRM_FORMAT_XRGB8888;
+-   case 30:
+-      return DRM_FORMAT_XRGB2101010;
+    case 32:
+       return DRM_FORMAT_ARGB8888;
++   case 30:
++      return DRM_FORMAT_ARGB2101010;
+    default:
+       return 0;
+    }
+ }
+ 
+-static VkResult get_supported_formats_and_modifiers(const util::allocator         &allocator,
+-                                                    xcb_connection_t              *connection,
+-                                                    xcb_window_t                   window,
+-                                                    uint32_t                      &bit_depth,
+-                                                    uint32_t                      &bpp,
+-                                                    util::vector<drm_format_pair> &supported_formats)
++static bool push_format(util::vector<drm_format_pair> &formats, uint32_t fourcc, uint64_t modifier)
+ {
+-   drm_format_pair drm_format = {};
+-
+-   xcb_get_geometry_reply_t *geometry = xcb_get_geometry_reply(connection,
+-                                                               xcb_get_geometry(connection, window),
+-                                                               NULL);
++   /* DRM_FORMAT_MOD_INVALID is not a real layout and cannot be imported by the Mali driver. */
++   if (modifier == DRM_FORMAT_MOD_INVALID)
++   {
++      return true;
++   }
++   for (const auto &format : formats)
++   {
++      if (format.fourcc == fourcc && format.modifier == modifier)
++      {
++         return true;
++      }
++   }
++   return formats.try_push_back(drm_format_pair{ fourcc, modifier });
++}
+ 
+-   if (geometry == NULL)
++static VkResult get_supported_formats_and_modifiers(xcb_connection_t *connection, xcb_window_t window,
++                                                    const connection_caps &caps, uint32_t &bit_depth, uint32_t &bpp,
++                                                    util::vector<drm_format_pair> &supported_formats)
++{
++   xcb_get_geometry_reply_t *geometry =
++      xcb_get_geometry_reply(connection, xcb_get_geometry(connection, window), nullptr);
++   if (geometry == nullptr)
++   {
+       return VK_ERROR_SURFACE_LOST_KHR;
++   }
+ 
+    bit_depth = geometry->depth;
+-   bpp = 32;
+-
++   bpp = (bit_depth == 16) ? 16 : 32;
+    free(geometry);
+ 
+-   xcb_generic_error_t                       *error     = nullptr;
+-   xcb_dri3_get_supported_modifiers_cookie_t mod_cookie =
+-      xcb_dri3_get_supported_modifiers(connection, window, bit_depth, bpp);
+-   xcb_dri3_get_supported_modifiers_reply_t *mod_reply  =
+-      xcb_dri3_get_supported_modifiers_reply(connection, mod_cookie, &error);
+-
+-   free(error);
+-
+-   if (!mod_reply || (mod_reply->num_window_modifiers == 0 && mod_reply->num_screen_modifiers == 0))
++   const uint32_t fourcc = drm_format_for_depth(bit_depth);
++   if (fourcc == 0)
+    {
+-      if (mod_reply)
+-      {
+-         free(mod_reply);
+-      }
+-
+-      // Xorg doesn't support modifiers by default, so we need to hardcode the drm_format and modifier here.
+-      drm_format.fourcc   = DRM_FORMAT_ARGB8888;
+-      drm_format.modifier = 0;
+-      supported_formats.try_push_back(drm_format);
+-
++      WSI_LOG_WARNING("Unsupported X window depth %u.", bit_depth);
+       return VK_SUCCESS;
+    }
+ 
+-   uint32_t n             = 0;
+-   uint32_t counts[2]     = {};
+-   uint64_t *modifiers[2] = {};
+-   uint32_t format        = 0;
+-
+-   if (mod_reply->num_window_modifiers)
++   /* GetSupportedModifiers is a DRI3 1.2 request: only use it when the server supports it. */
++   if (caps.has_dri3_modifiers)
+    {
+-      counts[n]    = mod_reply->num_window_modifiers;
+-      modifiers[n] = allocator.create<uint64_t>(counts[n]);
++      xcb_generic_error_t *error = nullptr;
++      xcb_dri3_get_supported_modifiers_reply_t *mod_reply = xcb_dri3_get_supported_modifiers_reply(
++         connection, xcb_dri3_get_supported_modifiers(connection, window, bit_depth, bpp), &error);
++      free(error);
+ 
+-      if (!modifiers[n])
++      if (mod_reply != nullptr)
+       {
+-         free(mod_reply);
+-         return VK_ERROR_UNKNOWN;
+-      }
+-
+-      memcpy(modifiers[n], xcb_dri3_get_supported_modifiers_window_modifiers(mod_reply),
+-                  counts[n] * sizeof(uint64_t));
+-      n++;
+-   }
+-
+-   if (mod_reply->num_screen_modifiers)
+-   {
+-      counts[n]    = mod_reply->num_screen_modifiers;
+-      modifiers[n] = allocator.create<uint64_t>(counts[n]);
++         /* Window modifiers first: they allow direct scanout of the window, screen modifiers only composition. */
++         const uint64_t *window_mods = xcb_dri3_get_supported_modifiers_window_modifiers(mod_reply);
++         for (uint32_t i = 0; i < mod_reply->num_window_modifiers; i++)
++         {
++            if (!push_format(supported_formats, fourcc, window_mods[i]))
++            {
++               free(mod_reply);
++               return VK_ERROR_OUT_OF_HOST_MEMORY;
++            }
++         }
+ 
+-      if (!modifiers[n])
+-      {
+-         if (n > 0)
++         const uint64_t *screen_mods = xcb_dri3_get_supported_modifiers_screen_modifiers(mod_reply);
++         for (uint32_t i = 0; i < mod_reply->num_screen_modifiers; i++)
+          {
+-            allocator.destroy(counts[0], modifiers[0]);
++            if (!push_format(supported_formats, fourcc, screen_mods[i]))
++            {
++               free(mod_reply);
++               return VK_ERROR_OUT_OF_HOST_MEMORY;
++            }
+          }
+          free(mod_reply);
+-         return VK_ERROR_UNKNOWN;
+       }
+-
+-      memcpy(modifiers[n], xcb_dri3_get_supported_modifiers_screen_modifiers(mod_reply),
+-             counts[n] * sizeof(uint64_t));
+-      n++;
+    }
+ 
+-   format = drm_format_for_depth(bit_depth, bpp);
+-
+-   drm_format.fourcc = format;
+-
+-   for (uint32_t i = 0; i < n; i++)
++   /* Xorg without modifier support, or DRI3 < 1.2: linear buffers are always importable by the X server. */
++   if (supported_formats.empty())
+    {
+-      for (uint32_t j = 0; j < counts[i]; j++)
++      if (!push_format(supported_formats, fourcc, DRM_FORMAT_MOD_LINEAR))
+       {
+-         drm_format.modifier = modifiers[i][j];
+-         supported_formats.try_push_back(drm_format);
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
+       }
+-      allocator.destroy(counts[i], modifiers[i]);
+    }
+ 
+-   free(mod_reply);
+    return VK_SUCCESS;
+ }
+ 
+@@ -203,27 +180,30 @@ surface::surface(const init_parameters &params)
+    : wsi::surface()
+    , supported_formats(params.allocator)
+    , properties(this, params.allocator)
+-   , present_pending(false)
+    , connection(params.connection)
+    , window(params.window)
+    , bit_depth(0)
+    , bpp(0)
++   , caps()
+ {
+ }
+ 
+-bool surface::init(const util::allocator &allocator)
++bool surface::init()
+ {
+-   VkResult vk_res = get_supported_formats_and_modifiers(allocator,
+-                                                         connection,
+-                                                         window,
+-                                                         bit_depth,
+-                                                         bpp, 
+-                                                         supported_formats);
+-   if (vk_res != VK_SUCCESS)
++   if (!connection_get_caps(connection, &caps))
+    {
++      WSI_LOG_ERROR("Failed to query the X server capabilities.");
+       return false;
+    }
+-   return true;
++
++   if (!caps.has_dri3 || !caps.has_present)
++   {
++      /* The surface can still be created; vkGetPhysicalDeviceSurfaceSupportKHR will report it as unsupported. */
++      WSI_LOG_WARNING("X server lacks DRI3 or Present: presentation will not be supported on this surface.");
++   }
++
++   return get_supported_formats_and_modifiers(connection, window, caps, bit_depth, bpp, supported_formats) ==
++          VK_SUCCESS;
+ }
+ 
+ util::unique_ptr<surface> surface::make_surface(const util::allocator &allocator, xcb_connection_t *connection,
+@@ -233,7 +213,7 @@ util::unique_ptr<surface> surface::make_surface(const util::allocator &allocator
+    auto wsi_surface = allocator.make_unique<surface>(params);
+    if (wsi_surface != nullptr)
+    {
+-      if (wsi_surface->init(allocator))
++      if (wsi_surface->init())
+       {
+          return wsi_surface;
+       }
+@@ -257,25 +237,5 @@ util::unique_ptr<swapchain_base> surface::allocate_swapchain(layer::device_priva
+    return util::unique_ptr<swapchain_base>(alloc.make_unique<swapchain>(dev_data, allocator, *this));
+ }
+ 
+-static void frame_done(void *data, uint32_t time)
+-{
+-   (void)time;
+-
+-   bool *present_pending = reinterpret_cast<bool *>(data);
+-   assert(present_pending);
+-
+-   *present_pending = false;
+-}
+-
+-bool surface::set_frame_callback()
+-{
+-   return true;
+-}
+-
+-bool surface::wait_next_frame_event()
+-{
+-   return true;
+-}
+-
+ } // namespace xcb
+ } // namespace wsi
+diff --git a/wsi/xcb/surface.hpp b/wsi/xcb/surface.hpp
+index e6fb952..4bef033 100644
+--- a/wsi/xcb/surface.hpp
++++ b/wsi/xcb/surface.hpp
+@@ -44,9 +44,13 @@
+ 
+ #pragma once
+ 
++#include <xcb/xcb.h>
++
+ #include "wsi/surface.hpp"
+ #include "surface_properties.hpp"
++#include "xcb_helpers.hpp"
+ 
++#include "util/custom_allocator.hpp"
+ #include "util/macros.hpp"
+ 
+ namespace wsi
+@@ -60,7 +64,6 @@ struct drm_format_pair
+    uint64_t modifier;
+ };
+ 
+-
+ class surface : public wsi::surface
+ {
+ public:
+@@ -68,9 +71,10 @@ public:
+    struct init_parameters;
+ 
+    /** Constructor to allow for custom allocation, but require privately defined arguments. */
+-   surface(const init_parameters&);
++   surface(const init_parameters &);
+ 
+-   static util::unique_ptr<surface> make_surface(const util::allocator &allocator, xcb_connection_t* connection, xcb_window_t window);
++   static util::unique_ptr<surface> make_surface(const util::allocator &allocator, xcb_connection_t *connection,
++                                                 xcb_window_t window);
+ 
+    /** Destructor */
+    ~surface() override;
+@@ -81,18 +85,14 @@ public:
+ 
+    /**
+     * @brief Get the XCB connection associated with the surface.
+-    *
+-    * @return The XCB connection.
+     */
+-   xcb_connection_t* get_xcb_connection() const
++   xcb_connection_t *get_xcb_connection() const
+    {
+       return connection;
+    }
+ 
+    /**
+     * @brief Get the XCB window associated with the surface.
+-    *
+-    * @return The XCB window.
+     */
+    xcb_window_t get_xcb_window() const
+    {
+@@ -100,9 +100,7 @@ public:
+    }
+ 
+    /**
+-    * @brief Get the bit depth of the surface.
+-    *
+-    * @return The bit depth of the surface.
++    * @brief Get the depth of the window (16, 24, 30 or 32).
+     */
+    uint32_t get_bit_depth() const
+    {
+@@ -110,9 +108,7 @@ public:
+    }
+ 
+    /**
+-    * @brief Get the bits per pixel (bpp) of the surface.
+-    *
+-    * @return The number of bits per pixel.
++    * @brief Get the bits per pixel used for the window's pixmaps.
+     */
+    uint32_t get_bpp() const
+    {
+@@ -120,31 +116,22 @@ public:
+    }
+ 
+    /**
+-    * @brief Returns a reference to a list of DRM formats supported by the XCB surface.
+-    *
+-    * The reference is valid throughout the lifetime of this surface.
++    * @brief Capabilities of the X server the window lives on (DRI3 version, Present, Xwayland).
+     */
+-   const util::vector<drm_format_pair> &get_formats() const
++   const connection_caps &get_connection_caps() const
+    {
+-      return supported_formats;
++      return caps;
+    }
+ 
+    /**
+-    * @brief Set the next frame callback.
++    * @brief Returns a reference to a list of DRM formats supported by the X server for this window.
+     *
+-    * Make a frame request on the compositor which will be applied in the next
+-    * wl_surface::commit. It overwrites previous requested frame events.
+-    *
+-    * @return true for success, false otherwise.
+-    */
+-   bool set_frame_callback();
+-
+-   /**
+-    * @brief Wait for the compositor's last requested frame event.
+-    *
+-    * @return true for success, false otherwise.
++    * The reference is valid throughout the lifetime of this surface.
+     */
+-   bool wait_next_frame_event();
++   const util::vector<drm_format_pair> &get_formats() const
++   {
++      return supported_formats;
++   }
+ 
+ private:
+    /**
+@@ -152,28 +139,18 @@ private:
+     *
+     * @return true on success, false otherwise.
+     */
+-   bool init(const util::allocator &allocator);
+-
+-   friend void surface_registry_handler(void *data, uint32_t name,
+-                                        const char *interface, uint32_t version) VWL_API_POST;
++   bool init();
+ 
+-   /** A list of DRM formats supported by the compositor on this surface */
++   /** A list of DRM formats supported by the X server on this window. */
+    util::vector<drm_format_pair> supported_formats;
+    /** Surface properties specific to the xcb surface. */
+    surface_properties properties;
+ 
+-   /**
+-    * @brief true when waiting for the server hint to present a buffer
+-    *
+-    * true if a buffer has been presented and we've not had a wl_surface::frame
+-    * callback to indicate the server is ready for the next buffer.
+-    */
+-   bool present_pending;
+-
+    xcb_connection_t *connection;
+-   xcb_window_t      window;
+-   uint32_t          bit_depth;
+-   uint32_t          bpp;
++   xcb_window_t window;
++   uint32_t bit_depth;
++   uint32_t bpp;
++   connection_caps caps;
+ };
+ 
+ } // namespace xcb
+diff --git a/wsi/xcb/surface_properties.cpp b/wsi/xcb/surface_properties.cpp
+index 01ab3f8..fe36d69 100644
+--- a/wsi/xcb/surface_properties.cpp
++++ b/wsi/xcb/surface_properties.cpp
+@@ -42,16 +42,9 @@
+ #define VK_USE_PLATFORM_XCB_KHR 1
+ #define VK_USE_PLATFORM_XLIB_KHR 1
+ 
+-#include <X11/Xlib-xcb.h>
+ #include <X11/Xlib.h>
++#include <X11/Xlib-xcb.h>
+ #include <xcb/xcb.h>
+-#include <xcb/dri3.h>
+-#include <xcb/present.h>
+-#include <xcb/shm.h>
+-
+-extern "C" {
+-#include <X11/xshmfence.h>
+-}
+ 
+ #include "xcb_helpers.hpp"
+ 
+@@ -61,16 +54,16 @@ extern "C" {
+ #include <array>
+ #include <cstring>
+ #include "surface_properties.hpp"
++#include "wsi/wsi_factory.hpp"
+ #include "surface.hpp"
+ #include "layer/private_data.hpp"
+ 
++#include "wsi/synchronization.hpp"
+ #include "util/drm/drm_utils.hpp"
+ #include "util/log.hpp"
+ #include "util/macros.hpp"
+ #include "util/helpers.hpp"
+ 
+-#define NELEMS(x) (sizeof(x) / sizeof(x[0]))
+-
+ namespace wsi
+ {
+ namespace xcb
+@@ -110,51 +103,59 @@ surface_properties &surface_properties::get_instance()
+ VkResult surface_properties::get_surface_capabilities(VkPhysicalDevice physical_device,
+                                                       VkSurfaceCapabilitiesKHR *pSurfaceCapabilities)
+ {
+-   xcb_connection_t          * conn       = specific_surface->get_xcb_connection();
+-   xcb_window_t              window       = specific_surface->get_xcb_window();
+-   xcb_get_geometry_cookie_t geom_cookie  = {};
+-   unsigned                  visual_depth = 0;
++   assert(specific_surface);
++   xcb_connection_t *conn = specific_surface->get_xcb_connection();
++   const xcb_window_t window = specific_surface->get_xcb_window();
+ 
+    /* Image count limits */
+    get_surface_capabilities_common(physical_device, pSurfaceCapabilities);
+-   // 4 images have a better performance in mailbox mode.
+-   pSurfaceCapabilities->minImageCount = 4;
+ 
+-   const char* env_var = getenv("XCB_SWAPCHAIN_MIN_IMAGE_COUNT");
+-   if(env_var)
++   /* 4 images give the best results in mailbox mode on the CIX platform. XCB_SWAPCHAIN_MIN_IMAGE_COUNT overrides
++    * it, clamped to [1, maxImageCount] (a value of 0 or above maxImageCount is invalid per the specification). */
++   uint32_t min_image_count = 4;
++   const char *env_var = getenv("XCB_SWAPCHAIN_MIN_IMAGE_COUNT");
++   if (env_var != nullptr)
+    {
+-      long min_image_count = strtol(env_var, nullptr, 0);
+-      if (min_image_count >= 0)
++      char *end = nullptr;
++      const long value = strtol(env_var, &end, 0);
++      if (end != env_var && value > 0)
++      {
++         min_image_count = static_cast<uint32_t>(std::min<long>(value, pSurfaceCapabilities->maxImageCount));
++      }
++      else
+       {
+-         pSurfaceCapabilities->minImageCount = min_image_count;
++         WSI_LOG_WARNING("Ignoring invalid XCB_SWAPCHAIN_MIN_IMAGE_COUNT=\"%s\".", env_var);
+       }
+    }
++   pSurfaceCapabilities->minImageCount = std::min(min_image_count, pSurfaceCapabilities->maxImageCount);
+ 
+-   geom_cookie = xcb_get_geometry(conn, window);
++   /* Issue the geometry request first so that it overlaps with the visual lookup round trips. */
++   const xcb_get_geometry_cookie_t geom_cookie = xcb_get_geometry(conn, window);
+ 
+-   xcb_visualtype_t *visual =
+-      get_visualtype_for_window(conn, window, &visual_depth);
++   unsigned visual_depth = 0;
++   const xcb_visualtype_t *visual = get_visualtype_for_window(conn, window, &visual_depth);
+ 
+-   if (!visual)
++   xcb_get_geometry_reply_t *geometry = xcb_get_geometry_reply(conn, geom_cookie, nullptr);
++   if (visual == nullptr || geometry == nullptr)
++   {
++      /* Always collect the reply, otherwise it stays queued in XCB forever. */
++      free(geometry);
+       return VK_ERROR_SURFACE_LOST_KHR;
++   }
+ 
+-   xcb_get_geometry_reply_t *geometry =
+-      xcb_get_geometry_reply(conn, geom_cookie, NULL);
+-
+-   if (geometry == NULL)
+-      return VK_ERROR_SURFACE_LOST_KHR;
+- 
+    pSurfaceCapabilities->currentExtent.width = geometry->width;
+    pSurfaceCapabilities->currentExtent.height = geometry->height;
+-
+    free(geometry);
+ 
+-   if (visual_has_alpha(visual, visual_depth)) {
+-      pSurfaceCapabilities->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR |
+-                                                      VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+-   } else {
+-      pSurfaceCapabilities->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR |
+-                                                      VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
++   if (visual_has_alpha(visual, visual_depth))
++   {
++      pSurfaceCapabilities->supportedCompositeAlpha =
++         VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR | VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
++   }
++   else
++   {
++      pSurfaceCapabilities->supportedCompositeAlpha =
++         VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR | VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    }
+ 
+    return VK_SUCCESS;
+@@ -316,6 +317,8 @@ VkResult surface_properties::get_surface_formats(VkPhysicalDevice physical_devic
+ VkResult surface_properties::get_surface_present_modes(VkPhysicalDevice physical_device, VkSurfaceKHR surface,
+                                                        uint32_t *pPresentModeCount, VkPresentModeKHR *pPresentModes)
+ {
++   UNUSED(physical_device);
++   UNUSED(surface);
+    return get_surface_present_modes_common(pPresentModeCount, pPresentModes, m_supported_modes);
+ }
+ 
+@@ -350,44 +353,45 @@ VkResult surface_properties::get_required_instance_extensions(util::extension_li
+    return extension_list.add(required_instance_extensions.data(), required_instance_extensions.size());
+ }
+ 
+-struct required_properties
+-{
+-   bool dmabuf;
+-   bool explicit_sync;
+-};
+-
+-
+ VWL_VKAPI_CALL(VkBool32)
+-GetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physical_device,
+-                                           uint32_t queue_index,
+-                                           xcb_connection_t *connection,
+-                                           xcb_visualid_t visual_id)
++GetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physical_device, uint32_t queue_index,
++                                           xcb_connection_t *connection, xcb_visualid_t visual_id) VWL_API_POST
+ {
+-   bool dev_supports_sync =
+-      sync_fd_fence_sync::is_supported(layer::instance_private_data::get(physical_device), physical_device);
++   UNUSED(queue_index);
++
++   auto &instance_data = layer::instance_private_data::get(physical_device);
++   const bool dev_supports_sync = sync_fd_fence_sync::is_supported(instance_data, physical_device);
+    if (!dev_supports_sync)
+    {
+       return VK_FALSE;
+    }
+-   struct connection_caps caps = {0};
+ 
+-   connection_get_caps(connection, &caps);
++   if (!wsi::is_physical_device_wsi_capable(physical_device, instance_data.get_enabled_platforms()))
++   {
++      return VK_FALSE;
++   }
++
++   connection_caps caps;
++   if (!connection_get_caps(connection, &caps))
++   {
++      return VK_FALSE;
++   }
+ 
+-   if (caps.has_dri3 == false)
++   if (!caps.has_dri3)
+    {
+       WSI_LOG_ERROR("vulkan: No DRI3 support detected - required for presentation\n"
+                     "Note: you can probably enable DRI3 in your Xorg config\n");
+       return VK_FALSE;
+    }
+ 
+-   if (caps.has_present == false)
++   if (!caps.has_present)
+    {
+       WSI_LOG_ERROR("vulkan: No Present support detected - required for presentation\n"
+                     "Note: you can probably enable Present in your Xorg config\n");
+       return VK_FALSE;
+    }
+ 
+-   if ((!visual_supported(connection_get_visualtype(connection, visual_id))))
++   if (!visual_supported(connection_get_visualtype(connection, visual_id)))
+    {
+       return VK_FALSE;
+    }
+@@ -396,15 +400,11 @@ GetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physical_device,
+ }
+ 
+ VWL_VKAPI_CALL(VkBool32)
+-GetPhysicalDeviceXlibPresentationSupportKHR(VkPhysicalDevice physical_device,
+-                                           uint32_t queue_index,
+-                                           Display *dpy,
+-                                           VisualID visualID)
++GetPhysicalDeviceXlibPresentationSupportKHR(VkPhysicalDevice physical_device, uint32_t queue_index, Display *dpy,
++                                            VisualID visualID) VWL_API_POST
+ {
+-   return GetPhysicalDeviceXcbPresentationSupportKHR(physical_device,
+-                                                     queue_index,
+-                                                     XGetXCBConnection(dpy),
+-                                                     visualID);
++   return GetPhysicalDeviceXcbPresentationSupportKHR(physical_device, queue_index, XGetXCBConnection(dpy),
++                                                     static_cast<xcb_visualid_t>(visualID));
+ }
+ 
+ VWL_VKAPI_CALL(VkResult)
+diff --git a/wsi/xcb/swapchain.cpp b/wsi/xcb/swapchain.cpp
+index 022b733..5875ceb 100644
+--- a/wsi/xcb/swapchain.cpp
++++ b/wsi/xcb/swapchain.cpp
+@@ -43,22 +43,23 @@
+ #include "swapchain.hpp"
+ #include "surface_properties.hpp"
+ 
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <unistd.h>
++#include <fcntl.h>
+ #include <poll.h>
+-#include <sys/mman.h>
++#include <time.h>
++#include <unistd.h>
+ 
+-#include <cstdint>
+-#include <cstring>
++#include <algorithm>
+ #include <cassert>
+-#include <unistd.h>
+-#include <cstdlib>
+ #include <cerrno>
+-#include <cstdio>
++#include <chrono>
+ #include <climits>
+-#include <functional>
+-#include <array>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <iterator>
++
++#include <xcb/sync.h>
++#include <drm_fourcc.h>
+ 
+ #include "util/drm/drm_utils.hpp"
+ #include "util/log.hpp"
+@@ -68,33 +69,68 @@
+ 
+ #include "xcb_helpers.hpp"
+ 
+-#define MIN2( A, B )   ( (A)<(B) ? (A) : (B) )
+-#define MAX2( A, B )   ( (A)>(B) ? (A) : (B) )
++/* XXX this belongs in presentproto */
++#ifndef PresentWindowDestroyed
++#define PresentWindowDestroyed (1 << 0)
++#endif
+ 
+ namespace wsi
+ {
+ namespace xcb
+ {
+ 
+-const VkImageAspectFlagBits plane_flag_bits[MAX_PLANES] = {
+-   VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,
+-   VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT,
+-   VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT,
+-   VK_IMAGE_ASPECT_MEMORY_PLANE_3_BIT_EXT,
+-};
++namespace
++{
++
++constexpr uint64_t NSEC_PER_MSEC = 1000000ull;
++/* poll() granularity: start at 1 ms, grow up to 10 ms while nothing happens. */
++constexpr uint64_t POLL_INTERVAL_MIN_NS = 1 * NSEC_PER_MSEC;
++constexpr uint64_t POLL_INTERVAL_MAX_NS = 10 * NSEC_PER_MSEC;
++/* Without any Present event for this long, check (one round trip) that the window still exists. A destroyed window
++ * never sends the events we are waiting for (e.g. Zink destroys the X window before the Vulkan swapchain). */
++constexpr uint64_t WINDOW_CHECK_INTERVAL_NS = 250 * NSEC_PER_MSEC;
++
++uint64_t monotonic_time_ns()
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
++}
++
++uint64_t absolute_timeout_ns(uint64_t timeout)
++{
++   if (timeout == UINT64_MAX)
++   {
++      return UINT64_MAX;
++   }
++   const uint64_t now = monotonic_time_ns();
++   /* Saturate instead of wrapping around for very large finite timeouts. */
++   return (timeout > UINT64_MAX - now) ? UINT64_MAX : now + timeout;
++}
++
++int dup_cloexec(int fd)
++{
++   return fcntl(fd, F_DUPFD_CLOEXEC, 0);
++}
++
++} // namespace
+ 
+ swapchain::swapchain(layer::device_private_data &dev_data, const VkAllocationCallbacks *pAllocator,
+                      surface &wsi_surface)
+    : swapchain_base(dev_data, pAllocator)
+    , m_connection(wsi_surface.get_xcb_connection())
+    , m_window(wsi_surface.get_xcb_window())
+-   , m_wsi_surface(&wsi_surface)
+-   , m_wsi_allocator(nullptr)
+-   , m_image_creation_parameters({}, m_allocator, {}, {})
++   , m_present_event(nullptr)
++   , m_event_id(0)
++   , m_event_poller_active(false)
+    , m_last_present_msc(0)
+    , m_window_width(0)
+    , m_window_height(0)
+-
++   , m_force_copy(false)
++   , m_mailbox_async(false)
++   , m_wsi_surface(&wsi_surface)
++   , m_wsi_allocator(nullptr)
++   , m_image_creation_parameters({}, m_allocator, {}, {})
+ {
+    m_image_create_info.format = VK_FORMAT_UNDEFINED;
+ }
+@@ -103,12 +139,18 @@ swapchain::~swapchain()
+ {
+    teardown();
+ 
+-   xcb_unregister_for_special_event(m_connection, m_present_event);
+-   xcb_void_cookie_t cookie = xcb_present_select_input_checked(m_connection, m_event_id,
+-                                             m_window,
+-                                             XCB_PRESENT_EVENT_MASK_NO_EVENT);
+-   xcb_discard_reply(m_connection, cookie.sequence);
++   /* m_present_event is only valid if init_platform() got far enough. */
++   if (m_present_event != nullptr)
++   {
++      xcb_unregister_for_special_event(m_connection, m_present_event);
++      m_present_event = nullptr;
+ 
++      /* Checked + discarded: a BadWindow (window already destroyed) must not reach the application's event loop. */
++      const xcb_void_cookie_t cookie =
++         xcb_present_select_input_checked(m_connection, m_event_id, m_window, XCB_PRESENT_EVENT_MASK_NO_EVENT);
++      xcb_discard_reply(m_connection, cookie.sequence);
++      xcb_flush(m_connection);
++   }
+ 
+    if (m_wsi_allocator != nullptr)
+    {
+@@ -120,19 +162,40 @@ swapchain::~swapchain()
+ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKHR *swapchain_create_info,
+                                   bool &use_presentation_thread)
+ {
++   UNUSED(device);
++
++   const connection_caps &caps = m_wsi_surface->get_connection_caps();
++   if (!caps.has_dri3 || !caps.has_present)
++   {
++      WSI_LOG_ERROR("X server lacks DRI3 or Present, cannot create a swapchain.");
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
+    m_window_width = swapchain_create_info->imageExtent.width;
+    m_window_height = swapchain_create_info->imageExtent.height;
+-   WSI_LOG_INFO("Swapchain min image count is %d.", swapchain_create_info->minImageCount);
++   WSI_LOG_INFO("Swapchain min image count is %u.", swapchain_create_info->minImageCount);
+ 
+-   // Select event
++   /* Select the Present events of the window. This is the only request checked synchronously: if the window is
++    * already gone there is no point in going further. */
+    m_event_id = xcb_generate_id(m_connection);
++   const xcb_void_cookie_t cookie =
++      xcb_present_select_input_checked(m_connection, m_event_id, m_window,
++                                       XCB_PRESENT_EVENT_MASK_CONFIGURE_NOTIFY |
++                                          XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY | XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY);
++   m_present_event = xcb_register_for_special_xge(m_connection, &xcb_present_id, m_event_id, nullptr);
+ 
+-   xcb_present_select_input(m_connection, m_event_id, m_window,
+-                            XCB_PRESENT_EVENT_MASK_CONFIGURE_NOTIFY |
+-                            XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY  |
+-                            XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY);
+-
+-   m_present_event = xcb_register_for_special_xge(m_connection, &xcb_present_id, m_event_id, NULL);
++   xcb_generic_error_t *error = xcb_request_check(m_connection, cookie);
++   if (error != nullptr)
++   {
++      WSI_LOG_ERROR("Failed to select Present events on the window (X error %d).", error->error_code);
++      free(error);
++      return VK_ERROR_SURFACE_LOST_KHR;
++   }
++   if (m_present_event == nullptr)
++   {
++      WSI_LOG_ERROR("Failed to register for Present events.");
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
+ 
+    WSIALLOC_ASSERT_VERSION();
+    if (wsialloc_new(&m_wsi_allocator) != WSIALLOC_ERROR_NONE)
+@@ -141,55 +204,26 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
+       return VK_ERROR_INITIALIZATION_FAILED;
+    }
+ 
+-   set_adaptive_sync_property(m_connection, m_window, false);
++   set_adaptive_sync_property(m_connection, m_window, 0);
+ 
+-   use_presentation_thread = true;
+-   const char* env_var = getenv("DISABLE_XCB_PRESENT_THREAD");
+-   if (env_var)
+-   {
+-      use_presentation_thread = false;
+-   }
++   /* Environment is read once here instead of on every present. */
++   m_force_copy = (getenv("DISABLE_XCB_FLIP") != nullptr);
+ 
+-   return VK_SUCCESS;
+-}
+-
+-VkResult swapchain::get_fd_mem_type_index(int fd, uint32_t &mem_idx)
+-{
+-   VkMemoryFdPropertiesKHR mem_props = {};
+-   mem_props.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+-
+-   VkResult result = m_device_data.disp.GetMemoryFdPropertiesKHR(
+-      m_device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &mem_props);
+-   if (result != VK_SUCCESS)
+-   {
+-      WSI_LOG_ERROR("Error querying Fd properties.");
+-      return result;
+-   }
+-
+-   for (mem_idx = 0; mem_idx < VK_MAX_MEMORY_TYPES; mem_idx++)
++   /* XCB_PRESENT_OPTION_ASYNC gives MAILBOX semantics on Xwayland (the compositor never tears), but tears on a native
++    * Xorg server, where the Present extension already replaces queued presents without it.
++    * WSI_XCB_MAILBOX_ASYNC=0/1 overrides the detection. */
++   m_mailbox_async = caps.is_xwayland;
++   const char *async_env = getenv("WSI_XCB_MAILBOX_ASYNC");
++   if (async_env != nullptr)
+    {
+-      if (mem_props.memoryTypeBits & (1 << mem_idx))
+-      {
+-         break;
+-      }
++      m_mailbox_async = (strcmp(async_env, "0") != 0);
+    }
+ 
+-   assert(mem_idx < VK_MAX_MEMORY_TYPES);
++   use_presentation_thread = (getenv("DISABLE_XCB_PRESENT_THREAD") == nullptr);
+ 
+    return VK_SUCCESS;
+ }
+ 
+-static uint32_t get_same_fd_index(int fd, int const *fds)
+-{
+-   uint32_t index = 0;
+-   while (fd != fds[index])
+-   {
+-      index++;
+-   }
+-
+-   return index;
+-}
+-
+ VkResult swapchain::get_surface_compatible_formats(const VkImageCreateInfo &info,
+                                                    util::vector<wsialloc_format> &importable_formats,
+                                                    util::vector<uint64_t> &exportable_modifers,
+@@ -198,14 +232,14 @@ VkResult swapchain::get_surface_compatible_formats(const VkImageCreateInfo &info
+    TRY_LOG(util::get_drm_format_properties(m_device_data.physical_device, info.format, drm_format_props),
+            "Failed to get format properties");
+ 
++   const uint32_t fourcc = util::drm::vk_to_drm_format(info.format);
++
+    for (const auto &prop : drm_format_props)
+    {
+       bool is_supported = false;
+-      drm_format_pair drm_format{ util::drm::vk_to_drm_format(info.format), prop.drmFormatModifier };
+-
+       for (const auto &format : m_wsi_surface->get_formats())
+       {
+-         if (format.fourcc == drm_format.fourcc && format.modifier == drm_format.modifier)
++         if (format.fourcc == fourcc && format.modifier == prop.drmFormatModifier)
+          {
+             is_supported = true;
+             break;
+@@ -223,46 +257,43 @@ VkResult swapchain::get_surface_compatible_formats(const VkImageCreateInfo &info
+       format_props.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2_KHR;
+       format_props.pNext = &external_props;
+ 
+-      VkResult result = VK_SUCCESS;
+-      {
+-         VkPhysicalDeviceExternalImageFormatInfoKHR external_info = {};
+-         external_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO_KHR;
+-         external_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+-
+-         VkPhysicalDeviceImageDrmFormatModifierInfoEXT drm_mod_info = {};
+-         drm_mod_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT;
+-         drm_mod_info.pNext = &external_info;
+-         drm_mod_info.drmFormatModifier = prop.drmFormatModifier;
+-         drm_mod_info.sharingMode = info.sharingMode;
+-         drm_mod_info.queueFamilyIndexCount = info.queueFamilyIndexCount;
+-         drm_mod_info.pQueueFamilyIndices = info.pQueueFamilyIndices;
+-
+-         VkPhysicalDeviceImageFormatInfo2KHR image_info = {};
+-         image_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2_KHR;
+-         image_info.pNext = &drm_mod_info;
+-         image_info.format = info.format;
+-         image_info.type = info.imageType;
+-         image_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+-         image_info.usage = info.usage;
+-         image_info.flags = info.flags;
++      VkPhysicalDeviceExternalImageFormatInfoKHR external_info = {};
++      external_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO_KHR;
++      external_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++
++      VkPhysicalDeviceImageDrmFormatModifierInfoEXT drm_mod_info = {};
++      drm_mod_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT;
++      drm_mod_info.pNext = &external_info;
++      drm_mod_info.drmFormatModifier = prop.drmFormatModifier;
++      drm_mod_info.sharingMode = info.sharingMode;
++      drm_mod_info.queueFamilyIndexCount = info.queueFamilyIndexCount;
++      drm_mod_info.pQueueFamilyIndices = info.pQueueFamilyIndices;
++
++      VkPhysicalDeviceImageFormatInfo2KHR image_info = {};
++      image_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2_KHR;
++      image_info.pNext = &drm_mod_info;
++      image_info.format = info.format;
++      image_info.type = info.imageType;
++      image_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++      image_info.usage = info.usage;
++      image_info.flags = info.flags;
+ 
+ #if WSI_IMAGE_COMPRESSION_CONTROL_SWAPCHAIN
+-         VkImageCompressionControlEXT compression_control = {};
+-         compression_control.sType = VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT;
+-         compression_control.flags = m_image_compression_control_params.flags;
+-         compression_control.compressionControlPlaneCount =
+-            m_image_compression_control_params.compression_control_plane_count;
+-         compression_control.pFixedRateFlags = m_image_compression_control_params.fixed_rate_flags.data();
+-
+-         if (m_device_data.is_swapchain_compression_control_enabled())
+-         {
+-            compression_control.pNext = image_info.pNext;
+-            image_info.pNext = &compression_control;
+-         }
+-#endif
+-         result = m_device_data.instance_data.disp.GetPhysicalDeviceImageFormatProperties2KHR(
+-            m_device_data.physical_device, &image_info, &format_props);
++      VkImageCompressionControlEXT compression_control = {};
++      compression_control.sType = VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT;
++      compression_control.flags = m_image_compression_control_params.flags;
++      compression_control.compressionControlPlaneCount =
++         m_image_compression_control_params.compression_control_plane_count;
++      compression_control.pFixedRateFlags = m_image_compression_control_params.fixed_rate_flags.data();
++
++      if (m_device_data.is_swapchain_compression_control_enabled())
++      {
++         compression_control.pNext = image_info.pNext;
++         image_info.pNext = &compression_control;
+       }
++#endif
++      const VkResult result = m_device_data.instance_data.disp.GetPhysicalDeviceImageFormatProperties2KHR(
++         m_device_data.physical_device, &image_info, &format_props);
+       if (result != VK_SUCCESS)
+       {
+          continue;
+@@ -286,7 +317,7 @@ VkResult swapchain::get_surface_compatible_formats(const VkImageCreateInfo &info
+       if (external_props.externalMemoryProperties.externalMemoryFeatures &
+           VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT_KHR)
+       {
+-         if (!exportable_modifers.try_push_back(drm_format.modifier))
++         if (!exportable_modifers.try_push_back(prop.drmFormatModifier))
+          {
+             return VK_ERROR_OUT_OF_HOST_MEMORY;
+          }
+@@ -295,9 +326,9 @@ VkResult swapchain::get_surface_compatible_formats(const VkImageCreateInfo &info
+       if (external_props.externalMemoryProperties.externalMemoryFeatures &
+           VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT_KHR)
+       {
+-         uint64_t flags =
++         const uint64_t flags =
+             (prop.drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_DISJOINT_BIT) ? 0 : WSIALLOC_FORMAT_NON_DISJOINT;
+-         wsialloc_format import_format{ drm_format.fourcc, drm_format.modifier, flags };
++         const wsialloc_format import_format{ fourcc, prop.drmFormatModifier, flags };
+          if (!importable_formats.try_push_back(import_format))
+          {
+             return VK_ERROR_OUT_OF_HOST_MEMORY;
+@@ -308,13 +339,11 @@ VkResult swapchain::get_surface_compatible_formats(const VkImageCreateInfo &info
+    return VK_SUCCESS;
+ }
+ 
+-VkResult swapchain::allocate_wsialloc(VkImageCreateInfo             &image_create_info,
+-                                      x11_image_data                *image_data,
++VkResult swapchain::allocate_wsialloc(const VkImageCreateInfo &image_create_info, x11_image_data *image_data,
+                                       util::vector<wsialloc_format> &importable_formats,
+-                                      wsialloc_format               *allocated_format,
+-                                      bool                          avoid_allocation)
++                                      wsialloc_format *allocated_format, bool avoid_allocation)
+ {
+-   bool is_protected_memory = (image_create_info.flags & VK_IMAGE_CREATE_PROTECTED_BIT) != 0;
++   const bool is_protected_memory = (image_create_info.flags & VK_IMAGE_CREATE_PROTECTED_BIT) != 0;
+    uint64_t allocation_flags = is_protected_memory ? WSIALLOC_ALLOCATE_PROTECTED : 0;
+    if (avoid_allocation)
+    {
+@@ -328,11 +357,12 @@ VkResult swapchain::allocate_wsialloc(VkImageCreateInfo             &image_creat
+    }
+ #endif
+ 
+-   wsialloc_allocate_info alloc_info = { importable_formats.data(), static_cast<unsigned>(importable_formats.size()),
+-                                         image_create_info.extent.width, image_create_info.extent.height,
+-                                         allocation_flags };
++   const wsialloc_allocate_info alloc_info = { importable_formats.data(),
++                                               static_cast<unsigned>(importable_formats.size()),
++                                               image_create_info.extent.width, image_create_info.extent.height,
++                                               allocation_flags };
+ 
+-   wsialloc_allocate_result alloc_result = { 0 };
++   wsialloc_allocate_result alloc_result = {};
+    /* Clear buffer_fds and average_row_strides for error purposes */
+    for (int i = 0; i < WSIALLOC_MAX_PLANES; ++i)
+    {
+@@ -340,7 +370,6 @@ VkResult swapchain::allocate_wsialloc(VkImageCreateInfo             &image_creat
+       alloc_result.average_row_strides[i] = -1;
+    }
+    const auto res = wsialloc_alloc(m_wsi_allocator, &alloc_info, &alloc_result);
+-
+    if (res != WSIALLOC_ERROR_NONE)
+    {
+       WSI_LOG_ERROR("Failed allocation of DMA Buffer. WSI error: %d", static_cast<int>(res));
+@@ -357,7 +386,7 @@ VkResult swapchain::allocate_wsialloc(VkImageCreateInfo             &image_creat
+    external_memory.set_buffer_fds(alloc_result.buffer_fds);
+    external_memory.set_offsets(alloc_result.offsets);
+ 
+-   uint32_t num_planes = util::drm::drm_fourcc_format_get_num_planes(alloc_result.format.fourcc);
++   const uint32_t num_planes = util::drm::drm_fourcc_format_get_num_planes(alloc_result.format.fourcc);
+ 
+    if (!avoid_allocation)
+    {
+@@ -382,12 +411,11 @@ VkResult swapchain::allocate_wsialloc(VkImageCreateInfo             &image_creat
+    return VK_SUCCESS;
+ }
+ 
+-static VkResult fill_image_create_info(VkImageCreateInfo                             &image_create_info,
+-                                       util::vector<VkSubresourceLayout>             &image_plane_layouts,
++static VkResult fill_image_create_info(VkImageCreateInfo &image_create_info,
++                                       util::vector<VkSubresourceLayout> &image_plane_layouts,
+                                        VkImageDrmFormatModifierExplicitCreateInfoEXT &drm_mod_info,
+-                                       VkExternalMemoryImageCreateInfoKHR            &external_info,
+-                                        x11_image_data                               &image_data,
+-                                       uint64_t                                       modifier)
++                                       VkExternalMemoryImageCreateInfoKHR &external_info, x11_image_data &image_data,
++                                       uint64_t modifier)
+ {
+    TRY_LOG_CALL(image_data.external_mem.fill_image_plane_layouts(image_plane_layouts));
+ 
+@@ -398,155 +426,153 @@ static VkResult fill_image_create_info(VkImageCreateInfo
+ 
+    image_data.external_mem.fill_drm_mod_info(image_create_info.pNext, drm_mod_info, image_plane_layouts, modifier);
+    image_data.external_mem.fill_external_info(external_info, &drm_mod_info);
+-   image_create_info.pNext  = &external_info;
++   image_create_info.pNext = &external_info;
+    image_create_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+    return VK_SUCCESS;
+ }
+ 
+-VkResult swapchain::allocate_image(VkImageCreateInfo &image_create_info,
+-                                   x11_image_data    *image_data)
++VkResult swapchain::allocate_image(x11_image_data *image_data)
+ {
+    util::vector<wsialloc_format> importable_formats(util::allocator(m_allocator, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND));
+-   auto &m_allocated_format = m_image_creation_parameters.m_allocated_format;
++   auto &allocated_format = m_image_creation_parameters.m_allocated_format;
+ 
+-   if (!importable_formats.try_push_back(m_allocated_format))
++   if (!importable_formats.try_push_back(allocated_format))
+    {
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+-   TRY_LOG_CALL(allocate_wsialloc(m_image_create_info, image_data, importable_formats, &m_allocated_format, false));
++   TRY_LOG_CALL(allocate_wsialloc(m_image_create_info, image_data, importable_formats, &allocated_format, false));
+ 
+    return VK_SUCCESS;
+ }
+ 
+-VkResult swapchain::x11_image_init(VkImageCreateInfo         image_create_info,
+-                                   x11_image_data            *image_data,
+-                                   image_creation_parameters &creation_parameters)
++VkResult swapchain::x11_image_init(const VkImageCreateInfo &image_create_info, x11_image_data *image_data,
++                                   const image_creation_parameters &creation_parameters)
+ {
+-   xcb_void_cookie_t cookie      = {};
+-   std::array<int, 4> buffer_fds = image_data->external_mem.get_buffer_fds();
++   auto &ext_mem = image_data->external_mem;
++   const auto &buffer_fds = ext_mem.get_buffer_fds();
++   const auto &strides = ext_mem.get_strides();
++   const auto &offsets = ext_mem.get_offsets();
++   const uint32_t num_planes = ext_mem.get_num_planes();
++   const uint64_t modifier = creation_parameters.m_allocated_format.modifier;
++   const connection_caps &caps = m_wsi_surface->get_connection_caps();
++
++   if (num_planes == 0 || num_planes > 4 || buffer_fds[0] < 0)
++   {
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++   if (image_create_info.extent.width > UINT16_MAX || image_create_info.extent.height > UINT16_MAX)
++   {
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   const uint8_t depth = static_cast<uint8_t>(m_wsi_surface->get_bit_depth());
++   const uint8_t bpp = static_cast<uint8_t>(m_wsi_surface->get_bpp());
++   const auto width = static_cast<uint16_t>(image_create_info.extent.width);
++   const auto height = static_cast<uint16_t>(image_create_info.extent.height);
+ 
+-   image_data->pixmap = xcb_generate_id(m_connection);
++   xcb_pixmap_t pixmap = xcb_generate_id(m_connection);
++   xcb_void_cookie_t cookie = {};
+ 
+-   if (creation_parameters.m_allocated_format.modifier != DRM_FORMAT_MOD_INVALID)
++   if (caps.has_dri3_modifiers)
+    {
+-      int fds[4] = { -1, -1, -1, -1 };
+-      for (int i = 0; i < image_data->external_mem.get_num_planes(); i++)
++      /* DRI3 >= 1.2: one fd per plane. XCB takes ownership of the fds and closes them once sent. */
++      int32_t fds[4] = { -1, -1, -1, -1 };
++      uint32_t plane_strides[4] = { 0, 0, 0, 0 };
++      uint32_t plane_offsets[4] = { 0, 0, 0, 0 };
++      for (uint32_t i = 0; i < num_planes; i++)
+       {
+-         fds[i] = dup(buffer_fds[0]);
+-
+-         if (fds[i] == -1) {
+-            for (int j = 0; j < i; j++)
++         /* Disjoint images have one dma-buf per plane; the previous code always duplicated plane 0's fd. */
++         const int source_fd = (buffer_fds[i] >= 0) ? buffer_fds[i] : buffer_fds[0];
++         fds[i] = dup_cloexec(source_fd);
++         if (fds[i] < 0)
++         {
++            for (uint32_t j = 0; j < i; j++)
++            {
+                close(fds[j]);
+-
++            }
+             return VK_ERROR_OUT_OF_HOST_MEMORY;
+          }
++         plane_strides[i] = static_cast<uint32_t>(strides[i]);
++         plane_offsets[i] = offsets[i];
+       }
+ 
+-      cookie =
+-         xcb_dri3_pixmap_from_buffers_checked(m_connection,
+-                                              image_data->pixmap,
+-                                              m_window,
+-                                              image_data->external_mem.get_num_planes(),
+-                                              image_create_info.extent.width,
+-                                              image_create_info.extent.height,
+-                                              image_data->external_mem.get_strides()[0],
+-                                              image_data->external_mem.get_offsets()[0],
+-                                              image_data->external_mem.get_strides()[1],
+-                                              image_data->external_mem.get_offsets()[1],
+-                                              image_data->external_mem.get_strides()[2],
+-                                              image_data->external_mem.get_offsets()[2],
+-                                              image_data->external_mem.get_strides()[3],
+-                                              image_data->external_mem.get_offsets()[3],
+-                                              m_wsi_surface->get_bit_depth(),
+-                                              m_wsi_surface->get_bpp(),
+-                                              creation_parameters.m_allocated_format.modifier,
+-                                              fds);
++      cookie = xcb_dri3_pixmap_from_buffers_checked(m_connection, pixmap, m_window, static_cast<uint8_t>(num_planes),
++                                                    width, height, plane_strides[0], plane_offsets[0], plane_strides[1],
++                                                    plane_offsets[1], plane_strides[2], plane_offsets[2],
++                                                    plane_strides[3], plane_offsets[3], depth, bpp, modifier, fds);
+    }
+    else
+    {
+-      int fd = dup(buffer_fds[0]);
+-      if (fd == -1)
++      /* DRI3 1.0/1.1: single plane, implicit (linear) layout only. */
++      if (num_planes != 1 || modifier != DRM_FORMAT_MOD_LINEAR || strides[0] <= 0 || strides[0] > UINT16_MAX)
+       {
+-         return VK_ERROR_OUT_OF_HOST_MEMORY;
++         WSI_LOG_ERROR("Buffer layout not supported by the X server (DRI3 < 1.2).");
++         return VK_ERROR_FORMAT_NOT_SUPPORTED;
++      }
++      const uint64_t size = static_cast<uint64_t>(height) * static_cast<uint64_t>(strides[0]);
++      if (size > UINT32_MAX)
++      {
++         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+       }
+ 
+-      uint32_t size   = image_create_info.extent.height * image_data->external_mem.get_strides()[0];
+-               cookie = xcb_dri3_pixmap_from_buffer_checked(m_connection,
+-                                                            image_data->pixmap,
+-                                                            m_window,
+-                                                            size,
+-                                                            image_create_info.extent.width,
+-                                                            image_create_info.extent.height,
+-                                                            image_data->external_mem.get_strides()[0],
+-                                                            m_wsi_surface->get_bit_depth(),
+-                                                            m_wsi_surface->get_bpp(),
+-                                                            fd);
++      const int fd = dup_cloexec(buffer_fds[0]);
++      if (fd < 0)
++      {
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++      cookie = xcb_dri3_pixmap_from_buffer_checked(m_connection, pixmap, m_window, static_cast<uint32_t>(size), width,
++                                                   height, static_cast<uint16_t>(strides[0]), depth, bpp, fd);
+    }
+ 
+-   xcb_flush(m_connection);
+-   xcb_discard_reply(m_connection, cookie.sequence);
+-
+-   xcb_generic_error_t *error   = xcb_request_check(m_connection, cookie);
+-   VkResult            result   = VK_SUCCESS;
+-   int                 fence_fd = -1;
+-
+-   if (error)
++   /* One round trip per image, at creation time only. The previous code called xcb_discard_reply() before
++    * xcb_request_check(), which discarded the error and made every failure look like a success. */
++   xcb_generic_error_t *error = xcb_request_check(m_connection, cookie);
++   if (error != nullptr)
+    {
+-      WSI_LOG_ERROR("Could not create pixmap from buffer with error %d \n", error->error_code);
++      WSI_LOG_ERROR("Could not create pixmap from buffer (X error %d).", error->error_code);
+       free(error);
+-      result = VK_ERROR_UNKNOWN;
++      return VK_ERROR_INITIALIZATION_FAILED;
+    }
++   image_data->pixmap = pixmap;
+ 
+-   if (result == VK_SUCCESS)
++   /* Idle fence: triggered by the X server once it no longer reads the pixmap. */
++   const int fence_fd = xshmfence_alloc_shm();
++   if (fence_fd < 0)
+    {
+-      fence_fd = xshmfence_alloc_shm();
+-      result   = fence_fd < 0 ? VK_ERROR_UNKNOWN : VK_SUCCESS;
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+ 
+-   if (result == VK_SUCCESS)
+-   {
+-      image_data->shm_fence = xshmfence_map_shm(fence_fd);
+-      result                = image_data->shm_fence == NULL ? VK_ERROR_UNKNOWN : VK_SUCCESS;
+-   }
+-   else if (fence_fd >= 0)
++   image_data->shm_fence = xshmfence_map_shm(fence_fd);
++   if (image_data->shm_fence == nullptr)
+    {
+       close(fence_fd);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+ 
+-   if (result == VK_SUCCESS)
+-   {
+-      image_data->sync_fence = xcb_generate_id(m_connection);
+-      xcb_dri3_fence_from_fd(m_connection,
+-                             image_data->pixmap,
+-                             image_data->sync_fence,
+-                             false,
+-                             fence_fd);
+-      xshmfence_trigger(image_data->shm_fence);
+-   }
+-   else
+-   {
+-      cookie = xcb_free_pixmap(m_connection, image_data->pixmap);
+-      xcb_discard_reply(m_connection, cookie.sequence);
+-   }
++   image_data->sync_fence = xcb_generate_id(m_connection);
++   /* XCB takes ownership of fence_fd. */
++   xcb_dri3_fence_from_fd(m_connection, image_data->pixmap, image_data->sync_fence, false, fence_fd);
++   xshmfence_trigger(image_data->shm_fence);
++   xcb_flush(m_connection);
+ 
+-   return result;
++   return VK_SUCCESS;
+ }
+ 
+-VkResult swapchain::allocate_and_bind_swapchain_image(VkImageCreateInfo  image_create_info,
+-                                                    swapchain_image   &image)
++VkResult swapchain::allocate_and_bind_swapchain_image(VkImageCreateInfo image_create_info, swapchain_image &image)
+ {
++   UNUSED(image_create_info);
++
+    std::unique_lock<std::recursive_mutex> image_status_lock(m_image_status_mutex);
+    image.status = swapchain_image::FREE;
+ 
+    assert(image.data != nullptr);
+    auto image_data = static_cast<x11_image_data *>(image.data);
+-   TRY_LOG(allocate_image(image_create_info, image_data),
+-          "Failed to allocate image");
++   TRY_LOG(allocate_image(image_data), "Failed to allocate image");
+ 
+    image_status_lock.unlock();
+ 
+-   TRY_LOG(x11_image_init(image_create_info, image_data, m_image_creation_parameters),
+-           "Failed to init x11 image.");
++   /* m_image_create_info holds the final format/extent selected in create_swapchain_image(). */
++   TRY_LOG(x11_image_init(m_image_create_info, image_data, m_image_creation_parameters), "Failed to init x11 image.");
+ 
+    TRY_LOG(image_data->external_mem.import_memory_and_bind_swapchain_image(image.image),
+            "Failed to import memory and bind swapchain image");
+@@ -555,7 +581,7 @@ VkResult swapchain::allocate_and_bind_swapchain_image(VkImageCreateInfo  image_c
+    auto present_fence = sync_fd_fence_sync::create(m_device_data);
+    if (!present_fence.has_value())
+    {
+-      destroy_image(image);
++      /* Resources are released by destroy_image() when the swapchain is torn down. */
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+ 
+@@ -592,10 +618,10 @@ VkResult swapchain::create_swapchain_image(VkImageCreateInfo image_create_info,
+          return VK_ERROR_INITIALIZATION_FAILED;
+       }
+ 
+-      wsialloc_format allocated_format = { 0 };
++      wsialloc_format allocated_format = {};
+       TRY_LOG_CALL(allocate_wsialloc(image_create_info, image_data, importable_formats, &allocated_format, true));
+ 
+-      for (auto &prop : drm_format_props)
++      for (const auto &prop : drm_format_props)
+       {
+          if (prop.drmFormatModifier == allocated_format.modifier)
+          {
+@@ -603,12 +629,9 @@ VkResult swapchain::create_swapchain_image(VkImageCreateInfo image_create_info,
+          }
+       }
+ 
+-      TRY_LOG_CALL(fill_image_create_info(image_create_info,
+-                                          m_image_creation_parameters.m_image_layout,
+-                                          m_image_creation_parameters.m_drm_mod_info,
+-                                          m_image_creation_parameters.m_external_info,
+-                                          *image_data,
+-                                          allocated_format.modifier));
++      TRY_LOG_CALL(fill_image_create_info(
++         image_create_info, m_image_creation_parameters.m_image_layout, m_image_creation_parameters.m_drm_mod_info,
++         m_image_creation_parameters.m_external_info, *image_data, allocated_format.modifier));
+ 
+       m_image_create_info = image_create_info;
+       m_image_creation_parameters.m_allocated_format = allocated_format;
+@@ -617,113 +640,250 @@ VkResult swapchain::create_swapchain_image(VkImageCreateInfo image_create_info,
+    return m_device_data.disp.CreateImage(m_device, &m_image_create_info, get_allocation_callbacks(), &image.image);
+ }
+ 
+-void swapchain::present_image(const pending_present_request &pending_present)
++void swapchain::release_server_owned_images()
+ {
+-   int res;
+-
+-   // Poll the present event to unpresent the idle image.
+-   xcb_present_generic_event_t *poll_event;
+-   while (poll_event = (xcb_present_generic_event_t*)xcb_poll_for_special_event(m_connection, m_present_event))
++   std::unique_lock<std::recursive_mutex> image_status_lock(m_image_status_mutex);
++   for (uint32_t i = 0; i < m_swapchain_images.size(); i++)
+    {
+-      handle_dri3_present_event(poll_event);
++      const auto status = m_swapchain_images[i].status;
++      /* Only images held by the presentation engine: ACQUIRED images belong to the application. */
++      if (status == swapchain_image::PENDING || status == swapchain_image::PRESENTED)
++      {
++         unpresent_image(i);
++      }
+    }
++}
+ 
+-   x11_image_data *image_data = reinterpret_cast<x11_image_data *>(m_swapchain_images[pending_present.image_index].data);
+-
+-   xshmfence_reset(image_data->shm_fence);
+-
+-   uint64_t target_msc = 0;
+-   if (m_present_mode == VK_PRESENT_MODE_FIFO_KHR)
++void swapchain::handle_present_event_locked(xcb_present_generic_event_t *event)
++{
++   switch (event->evtype)
+    {
+-      target_msc = m_last_present_msc + 1;
++   case XCB_PRESENT_CONFIGURE_NOTIFY:
++   {
++      auto *config = reinterpret_cast<xcb_present_configure_notify_event_t *>(event);
++      if (config->pixmap_flags & PresentWindowDestroyed)
++      {
++         WSI_LOG_INFO("X window destroyed.");
++         set_error_state(VK_ERROR_SURFACE_LOST_KHR);
++         release_server_owned_images();
++      }
++      else if (config->width != m_window_width || config->height != m_window_height)
++      {
++         WSI_LOG_INFO("Window size changed!");
++         /* Never overrides a real error, see swapchain_base::set_error_state(). */
++         set_error_state(VK_SUBOPTIMAL_KHR);
++      }
++      break;
+    }
+-   uint64_t remainder = 0;
+-   uint64_t divisor = 0;
+-   uint32_t options = XCB_PRESENT_OPTION_NONE;
+-
+-   if (m_present_mode == VK_PRESENT_MODE_MAILBOX_KHR)
++   case XCB_PRESENT_EVENT_IDLE_NOTIFY:
+    {
+-      options |= XCB_PRESENT_OPTION_ASYNC;
++      auto *idle = reinterpret_cast<xcb_present_idle_notify_event_t *>(event);
++      std::unique_lock<std::recursive_mutex> image_status_lock(m_image_status_mutex);
++      for (uint32_t i = 0; i < m_swapchain_images.size(); i++)
++      {
++         auto &img = m_swapchain_images[i];
++         if (img.data == nullptr ||
++             (img.status != swapchain_image::PENDING && img.status != swapchain_image::PRESENTED))
++         {
++            continue;
++         }
++         auto *image_data = reinterpret_cast<x11_image_data *>(img.data);
++         if (image_data->pixmap == idle->pixmap)
++         {
++            /* Make sure X has released that image before the driver reuses it. */
++            xshmfence_await(image_data->shm_fence);
++            unpresent_image(i);
++            break;
++         }
++      }
++      break;
+    }
+-   const char* env_var = getenv("DISABLE_XCB_FLIP");
+-   if(env_var)
++   case XCB_PRESENT_EVENT_COMPLETE_NOTIFY:
+    {
+-      options |= XCB_PRESENT_OPTION_COPY;
++      auto *complete = reinterpret_cast<xcb_present_complete_notify_event_t *>(event);
++      if (complete->kind == XCB_PRESENT_COMPLETE_KIND_PIXMAP)
++      {
++         m_last_present_msc = std::max(m_last_present_msc, complete->msc);
++      }
++      break;
+    }
++   default:
++      break;
++   }
++   free(event);
++}
+ 
+-   xcb_void_cookie_t cookie =
+-      xcb_present_pixmap_checked(m_connection,
+-                         m_window,
+-                         image_data->pixmap,
+-                         0,
+-                         0,                                    /* valid */
+-                         0,                                    /* update */
+-                         0,                                    /* x_off */
+-                         0,                                    /* y_off */
+-                         XCB_NONE,                             /* target_crtc */
+-                         XCB_NONE,
+-                         image_data->sync_fence,
+-                         options,
+-                         target_msc,
+-                         divisor,
+-                         remainder,
+-                         0,
+-                         NULL);
+-
+-   xcb_generic_error_t *error;
+-   if (error = xcb_request_check(m_connection, cookie))
+-   {
+-      WSI_LOG_ERROR("Could not present pixmap with error %d \n", error->error_code);
+-      set_error_state(VK_ERROR_OUT_OF_DATE_KHR);
+-      free(error);
+-      return;
++bool swapchain::drain_present_events_locked()
++{
++   if (m_present_event == nullptr)
++   {
++      return false;
+    }
+ 
+-   xcb_discard_reply(m_connection, cookie.sequence);
++   bool processed = false;
++   xcb_generic_event_t *event = nullptr;
++   while ((event = xcb_poll_for_special_event(m_connection, m_present_event)) != nullptr)
++   {
++      handle_present_event_locked(reinterpret_cast<xcb_present_generic_event_t *>(event));
++      processed = true;
++   }
+ 
+-   /* We flush the request */
+-   xcb_flush (m_connection);
++   if (processed)
++   {
++      m_event_cv.notify_all();
++   }
++   return processed;
++}
++
++template <typename Predicate>
++VkResult swapchain::wait_for_present_events(uint64_t abs_timeout, Predicate done)
++{
++   uint64_t poll_interval_ns = POLL_INTERVAL_MIN_NS;
++   uint64_t last_activity_ns = monotonic_time_ns();
+ 
+-   // FIFO needs to wait for the frame to complete before starting a new loop.
+-   if (m_present_mode == VK_PRESENT_MODE_FIFO_KHR)
++   std::unique_lock<std::mutex> lock(m_event_mutex);
++   while (true)
+    {
++      if (drain_present_events_locked())
++      {
++         last_activity_ns = monotonic_time_ns();
++         poll_interval_ns = POLL_INTERVAL_MIN_NS;
++      }
+ 
+-      while (m_last_present_msc < target_msc)
++      if (done())
+       {
+-         // Check if the X window still exists at this point.
+-         // This is because, in the current Zink solution, the X window is always destroyed before the Vulkan
+-         // swapchain.
+-         // This prevents getting stuck when calling xcb_wait_for_special_event and has less CPU overhead.
+-         xcb_get_window_attributes_cookie_t att_cookie = xcb_get_window_attributes(m_connection, m_window);
+-         xcb_get_window_attributes_reply_t *reply = xcb_get_window_attributes_reply(m_connection, att_cookie, NULL);
+-         if (!reply)
+-         {
+-            // Free all images since the X window no longer exists.
+-            for (auto i = 0; i < m_swapchain_images.size(); i++)
+-            {
+-               if ((m_swapchain_images[i].status != swapchain_image::INVALID) &&
+-                   (m_swapchain_images[i].status != swapchain_image::FREE))
+-               {
+-                     unpresent_image(i);
+-               }
+-            }
++         return VK_SUCCESS;
++      }
+ 
+-            set_error_state(VK_ERROR_OUT_OF_DATE_KHR);
++      if (xcb_connection_has_error(m_connection))
++      {
++         set_error_state(VK_ERROR_SURFACE_LOST_KHR);
++         release_server_owned_images();
++         return VK_ERROR_SURFACE_LOST_KHR;
++      }
++
++      if (error_has_occured())
++      {
++         return get_error_state();
++      }
++
++      const uint64_t now = monotonic_time_ns();
++      if (abs_timeout != UINT64_MAX && now >= abs_timeout)
++      {
++         return VK_TIMEOUT;
++      }
++
++      if (now - last_activity_ns >= WINDOW_CHECK_INTERVAL_NS)
++      {
++         /* Round trip without holding the lock. */
++         lock.unlock();
++         const bool alive = window_exists(m_connection, m_window);
++         lock.lock();
++         if (!alive)
++         {
+             WSI_LOG_INFO("X window is lost!");
+-            return;
++            set_error_state(VK_ERROR_OUT_OF_DATE_KHR);
++            release_server_owned_images();
++            return VK_ERROR_OUT_OF_DATE_KHR;
+          }
+-         free(reply);
++         last_activity_ns = monotonic_time_ns();
++         continue;
++      }
+ 
+-         xcb_present_generic_event_t *event =
+-            (xcb_present_generic_event_t *)xcb_wait_for_special_event(m_connection, m_present_event);
++      uint64_t wait_ns = poll_interval_ns;
++      if (abs_timeout != UINT64_MAX)
++      {
++         wait_ns = std::min(wait_ns, abs_timeout - now);
++      }
++
++      if (m_event_poller_active)
++      {
++         /* Another thread is already blocked on the connection: wait for it to process the events. */
++         m_event_cv.wait_for(lock, std::chrono::nanoseconds(wait_ns));
++      }
++      else
++      {
++         m_event_poller_active = true;
++         lock.unlock();
+ 
+-         if (!event)
++         struct pollfd pfd = {};
++         pfd.fd = xcb_get_file_descriptor(m_connection);
++         pfd.events = POLLIN;
++         const int timeout_ms = static_cast<int>(std::max<uint64_t>(1, (wait_ns + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC));
++         const int ret = poll(&pfd, 1, timeout_ms);
++         const int poll_errno = errno;
++
++         lock.lock();
++         m_event_poller_active = false;
++         /* Let a waiting thread take over polling if this one is about to return. */
++         m_event_cv.notify_all();
++
++         if (ret < 0 && poll_errno != EINTR)
+          {
+-            WSI_LOG_INFO("Waiting for special event failed!");
+-            set_error_state(VK_ERROR_OUT_OF_DATE_KHR);
+-            return;
++            WSI_LOG_ERROR("poll() on the X connection failed (%d).", poll_errno);
++            set_error_state(VK_ERROR_SURFACE_LOST_KHR);
++            return VK_ERROR_SURFACE_LOST_KHR;
+          }
+-         handle_dri3_present_event(event);
++      }
++
++      /* Gradually increase the poll duration if nothing happens for a while: stutter is not the main concern
++       * anymore at that point. A Present event is normally received once every refresh period. */
++      poll_interval_ns = std::min(poll_interval_ns + poll_interval_ns / 2, POLL_INTERVAL_MAX_NS);
++   }
++}
++
++void swapchain::present_image(const pending_present_request &pending_present)
++{
++   auto *image_data = reinterpret_cast<x11_image_data *>(m_swapchain_images[pending_present.image_index].data);
++   const bool fifo = (m_present_mode == VK_PRESENT_MODE_FIFO_KHR);
++
++   uint64_t target_msc = 0;
++   {
++      /* Release the images that became idle before presenting a new one. */
++      std::lock_guard<std::mutex> lock(m_event_mutex);
++      drain_present_events_locked();
++      if (fifo)
++      {
++         target_msc = m_last_present_msc + 1;
++      }
++   }
++
++   xshmfence_reset(image_data->shm_fence);
++
++   uint32_t options = XCB_PRESENT_OPTION_NONE;
++   if (m_present_mode == VK_PRESENT_MODE_MAILBOX_KHR && m_mailbox_async)
++   {
++      options |= XCB_PRESENT_OPTION_ASYNC;
++   }
++   if (m_force_copy)
++   {
++      options |= XCB_PRESENT_OPTION_COPY;
++   }
++
++   /* The request is not checked synchronously: xcb_request_check() would cost a full round trip per frame.
++    * A failure (e.g. BadWindow) is detected through the window checks of wait_for_present_events(). */
++   const xcb_void_cookie_t cookie = xcb_present_pixmap_checked(
++      m_connection, m_window, image_data->pixmap, 0 /* serial */, XCB_NONE /* valid */, XCB_NONE /* update */,
++      0 /* x_off */, 0 /* y_off */, XCB_NONE /* target_crtc */, XCB_NONE /* wait_fence */, image_data->sync_fence,
++      options, target_msc, 0 /* divisor */, 0 /* remainder */, 0, nullptr);
++   xcb_discard_reply(m_connection, cookie.sequence);
++   xcb_flush(m_connection);
++
++   if (xcb_connection_has_error(m_connection))
++   {
++      set_error_state(VK_ERROR_SURFACE_LOST_KHR);
++      release_server_owned_images();
++      return;
++   }
++
++   /* FIFO: wait for the present to complete before the next one, so that exactly one image is shown per vblank. */
++   if (fifo)
++   {
++      const VkResult res =
++         wait_for_present_events(UINT64_MAX, [this, target_msc]() { return m_last_present_msc >= target_msc; });
++      if (res != VK_SUCCESS)
++      {
++         WSI_LOG_INFO("FIFO present wait ended with %d.", static_cast<int>(res));
+       }
+    }
+ }
+@@ -747,8 +907,8 @@ void swapchain::destroy_image(swapchain_image &image)
+ 
+    if (image.data != nullptr)
+    {
+-      auto              image_data = reinterpret_cast<x11_image_data *>(image.data);
+-      xcb_void_cookie_t cookie     = {};
++      auto image_data = reinterpret_cast<x11_image_data *>(image.data);
++      xcb_void_cookie_t cookie = {};
+ 
+       if (image_data->shm_fence != nullptr)
+       {
+@@ -756,14 +916,16 @@ void swapchain::destroy_image(swapchain_image &image)
+          xcb_discard_reply(m_connection, cookie.sequence);
+          xshmfence_unmap_shm(image_data->shm_fence);
+          image_data->shm_fence = nullptr;
++         image_data->sync_fence = XCB_NONE;
+       }
+ 
+-      if (image_data->pixmap != 0)
++      if (image_data->pixmap != XCB_NONE)
+       {
+          cookie = xcb_free_pixmap(m_connection, image_data->pixmap);
+          xcb_discard_reply(m_connection, cookie.sequence);
+-         image_data->pixmap = 0;
++         image_data->pixmap = XCB_NONE;
+       }
++      xcb_flush(m_connection);
+ 
+       m_allocator.destroy(1, image_data);
+       image.data = nullptr;
+@@ -772,12 +934,8 @@ void swapchain::destroy_image(swapchain_image &image)
+ 
+ bool swapchain::free_image_found()
+ {
+-   if (m_present_mode == VK_PRESENT_MODE_MAILBOX_KHR)
+-   {
+-      poll_present_event_for_pending_image();
+-   }
+-
+-   for (auto &img : m_swapchain_images)
++   std::unique_lock<std::recursive_mutex> image_status_lock(m_image_status_mutex);
++   for (const auto &img : m_swapchain_images)
+    {
+       if (img.status == swapchain_image::FREE)
+       {
+@@ -787,94 +945,29 @@ bool swapchain::free_image_found()
+    return false;
+ }
+ 
+-static int64_t os_time_get_nano(void)
+-{
+-   struct timespec tv;
+-   clock_gettime(CLOCK_MONOTONIC, &tv);
+-   return tv.tv_nsec + tv.tv_sec*INT64_C(1000000000);
+-}
+-
+-static int64_t os_time_get_absolute_timeout(uint64_t timeout)
+-{
+-   int64_t time, abs_timeout;
+-
+-   time = os_time_get_nano();
+-
+-   abs_timeout = time + (int64_t)timeout;
+-
+-   return abs_timeout;
+-}
+-
+ VkResult swapchain::get_free_buffer(uint64_t *timeout)
+ {
+-   uint64_t abs_timeout;
+-   VkResult ret = VK_SUCCESS;
+-   if (*timeout >= UINT64_MAX)
+-   {
+-      abs_timeout = UINT64_MAX;
+-   }
+-   else
+-   {
+-      abs_timeout = os_time_get_absolute_timeout(*timeout);
+-   }
+-
+-   struct pollfd pfd = {};
+-   uint64_t rel_timeout;
+-   /* Start out with 1 ms intervals since that's what poll() supports. */
+-   uint64_t poll_busywait_ns = 1000 * 1000;
+-
+-   /* Currently, the idle image will be unpresented in the present_image() function.
+-    * Since the presentation thread is enabled by default, the idle image can always
+-    * be unpresented by that thread.
+-    * If disable presentation thread, the idle image may not get a chance to unpresent
+-    * in some scenarios.
+-    *
+-    * The loop exits with a free image or timeout.
+-    */
+-   while (!free_image_found())
+-   {
+-      /* If a non-special event happens, the fd will still
+-       * poll. So recalculate the timeout now just in case.
+-       */
+-      struct timespec tv;
+-      uint64_t current_time = os_time_get_nano();
+-      if (abs_timeout > current_time)
+-         rel_timeout = MIN2(poll_busywait_ns, abs_timeout - current_time);
+-      else
+-         rel_timeout = 0;
++   /* Idle images are only returned through IdleNotify events, so they must be processed here in every present
++    * mode. Previously this was only done for MAILBOX: in FIFO an acquire could stall until the page flip thread
++    * happened to wake up (up to 100 ms). */
++   const VkResult res = wait_for_present_events(absolute_timeout_ns(*timeout), [this]() { return free_image_found(); });
+ 
+-      if (rel_timeout)
+-      {
+-         pfd.fd = xcb_get_file_descriptor(m_connection);
+-         pfd.events = POLLIN;
+-
+-         int err = poll(&pfd, 1, MAX2(rel_timeout / 1000 / 1000, 1u));
+-         if (err == -1)
+-         {
+-            WSI_LOG_INFO("Poll failed!");
+-            return VK_ERROR_OUT_OF_DATE_KHR;
+-         }
+-
+-         /* Gradually increase the poll duration if it takes a very long time to receive a poll event,
+-          * since at that point, stutter isn't really the main concern anymore.
+-          * We generally expect a special event to be received once every refresh duration. */
+-         poll_busywait_ns += poll_busywait_ns / 2;
+-         poll_busywait_ns = MIN2(10ull * 1000ull * 1000ull, poll_busywait_ns);
+-      }
+-
+-      if (rel_timeout == 0)
+-      {
+-         ret = VK_TIMEOUT;
+-         break;
+-      }
++   if (res == VK_TIMEOUT)
++   {
++      /* The previous code compared the pointer, not the value, with 0 and never returned VK_NOT_READY. */
++      return (*timeout == 0) ? VK_NOT_READY : VK_TIMEOUT;
+    }
++   return res;
++}
+ 
+-   if (ret == VK_TIMEOUT)
++void swapchain::update_pending_image_status()
++{
++   /* Never blocks: if another thread is processing events it will release the images. */
++   std::unique_lock<std::mutex> lock(m_event_mutex, std::try_to_lock);
++   if (lock.owns_lock())
+    {
+-      ret = timeout == 0 ? VK_NOT_READY : VK_TIMEOUT;
++      drain_present_events_locked();
+    }
+-
+-   return ret;
+ }
+ 
+ VkResult swapchain::image_set_present_payload(swapchain_image &image, VkQueue queue,
+@@ -893,107 +986,11 @@ VkResult swapchain::image_wait_present(swapchain_image &image, uint64_t timeout)
+ VkResult swapchain::bind_swapchain_image(VkDevice &device, const VkBindImageMemoryInfo *bind_image_mem_info,
+                                          const VkBindImageMemorySwapchainInfoKHR *bind_sc_info)
+ {
++   UNUSED(device);
+    const wsi::swapchain_image &swapchain_image = m_swapchain_images[bind_sc_info->imageIndex];
+    auto image_data = reinterpret_cast<x11_image_data *>(swapchain_image.data);
+    return image_data->external_mem.bind_swapchain_image_memory(bind_image_mem_info->image);
+ }
+ 
+-
+-/* XXX this belongs in presentproto */
+-#ifndef PresentWindowDestroyed
+-#define PresentWindowDestroyed (1 << 0)
+-#endif
+-/**
+- * Process an X11 Present event.
+- */
+-void swapchain::handle_dri3_present_event(xcb_present_generic_event_t *event)
+-{
+-   switch (event->evtype)
+-   {
+-   case XCB_PRESENT_CONFIGURE_NOTIFY:
+-   {
+-      xcb_present_configure_notify_event_t *config = (xcb_present_configure_notify_event_t *)event;
+-      if (config->pixmap_flags & PresentWindowDestroyed)
+-         set_error_state(VK_ERROR_SURFACE_LOST_KHR);
+-
+-      if (config->width != m_window_width ||
+-          config->height != m_window_height)
+-      {
+-         WSI_LOG_INFO("Window size changed!");
+-         set_error_state(VK_SUBOPTIMAL_KHR);
+-      }
+-
+-      break;
+-   }
+-   case XCB_PRESENT_EVENT_IDLE_NOTIFY:
+-   {
+-      xcb_present_idle_notify_event_t *idle = (xcb_present_idle_notify_event_t *)event;
+-      for (auto i = 0; i < m_swapchain_images.size(); i++)
+-      {
+-         if (m_swapchain_images[i].status != swapchain_image::INVALID)
+-         {
+-            auto image_data = reinterpret_cast<x11_image_data *>(m_swapchain_images[i].data);
+-            if (image_data->pixmap == idle->pixmap)
+-            {
+-               if (m_swapchain_images[i].status != swapchain_image::FREE)
+-               {
+-                  // Make sure X has released that image before the driver unpresents it.
+-                  xshmfence_await(image_data->shm_fence);
+-                  unpresent_image(i);
+-                  break;
+-               }
+-            }
+-         }
+-      }
+-      break;
+-   }
+-   case XCB_PRESENT_EVENT_COMPLETE_NOTIFY:
+-   {
+-      xcb_present_complete_notify_event_t *complete = (xcb_present_complete_notify_event_t *)event;
+-
+-      if (complete->kind == XCB_PRESENT_COMPLETE_KIND_PIXMAP)
+-      {
+-         m_last_present_msc = complete->msc;
+-      }
+-
+-      break;
+-   }
+-   default:
+-      break;
+-   }
+-   free(event);
+-}
+-
+-void swapchain::update_pending_image_status()
+-{
+-   if (m_present_mode == VK_PRESENT_MODE_FIFO_KHR)
+-   {
+-      poll_present_event_for_pending_image();
+-   }
+-}
+-
+-void swapchain::poll_present_event_for_pending_image()
+-{
+-   bool has_pending_image = false;
+-   for (auto &img : m_swapchain_images)
+-   {
+-      if (img.status == swapchain_image::PENDING)
+-      {
+-         has_pending_image = true;
+-         break;
+-      }
+-   }
+-   // Polling X present event before checking the image status.
+-   // This ensures that the driver can receive the free image from X promptly.
+-   if (has_pending_image)
+-   {
+-      xcb_present_generic_event_t *poll_event;
+-      while (poll_event = (xcb_present_generic_event_t *)xcb_poll_for_special_event(m_connection, m_present_event))
+-      {
+-         handle_dri3_present_event(poll_event);
+-      }
+-   }
+-}
+-
+ } // namespace xcb
+ } // namespace wsi
+diff --git a/wsi/xcb/swapchain.hpp b/wsi/xcb/swapchain.hpp
+index 631bbd3..326ed6e 100644
+--- a/wsi/xcb/swapchain.hpp
++++ b/wsi/xcb/swapchain.hpp
+@@ -46,14 +46,16 @@ extern "C" {
+ #include <vulkan/vk_icd.h>
+ }
+ 
+-#include <X11/Xlib-xcb.h>
+-extern "C" {
+-#include <X11/xshmfence.h>
+-}
++#include <cstdint>
++#include <condition_variable>
++#include <mutex>
++
+ #include <xcb/xcb.h>
+ #include <xcb/dri3.h>
+ #include <xcb/present.h>
+-#include <xcb/shm.h>
++extern "C" {
++#include <X11/xshmfence.h>
++}
+ 
+ #include "util/wsialloc/wsialloc.h"
+ #include "util/custom_allocator.hpp"
+@@ -69,24 +71,22 @@ struct x11_image_data
+ {
+    x11_image_data(const VkDevice &device, const util::allocator &allocator)
+       : external_mem(device, allocator)
+-      , pixmap(0)
++      , pixmap(XCB_NONE)
+       , present_fence()
+       , shm_fence(nullptr)
+-      , sync_fence(0)
+-      , serial(0)
+-      , shmseg(0)
+-      , shmid(-1)
++      , sync_fence(XCB_NONE)
+    {
+-   };
++   }
+ 
+-   external_memory    external_mem;
+-   xcb_pixmap_t       pixmap;
++   external_memory external_mem;
++   /** X pixmap wrapping the image dma-buf (DRI3). */
++   xcb_pixmap_t pixmap;
++   /** Fence signalled when the GPU has finished rendering the image. */
+    sync_fd_fence_sync present_fence;
+-   struct xshmfence  *shm_fence;
+-   uint32_t           sync_fence;
+-   uint32_t           serial;
+-   xcb_shm_seg_t      shmseg;
+-   int                shmid;
++   /** Shared-memory fence triggered by the X server once it no longer reads the pixmap. */
++   struct xshmfence *shm_fence;
++   /** X Sync fence object backed by @ref shm_fence. */
++   uint32_t sync_fence;
+ };
+ 
+ struct image_creation_parameters
+@@ -97,10 +97,11 @@ struct image_creation_parameters
+    VkExternalMemoryImageCreateInfoKHR m_external_info;
+    VkImageDrmFormatModifierExplicitCreateInfoEXT m_drm_mod_info;
+ 
+-   image_creation_parameters(wsialloc_format allocated_format,
+-                             util::allocator allocator, VkExternalMemoryImageCreateInfoKHR external_info,
++   image_creation_parameters(wsialloc_format allocated_format, util::allocator allocator,
++                             VkExternalMemoryImageCreateInfoKHR external_info,
+                              VkImageDrmFormatModifierExplicitCreateInfoEXT drm_mod_info)
+-      : m_allocated_format(allocated_format)
++      : m_image_create_info()
++      , m_allocated_format(allocated_format)
+       , m_image_layout(allocator)
+       , m_external_info(external_info)
+       , m_drm_mod_info(drm_mod_info)
+@@ -116,9 +117,6 @@ public:
+ 
+    ~swapchain();
+ 
+-   /* TODO: make the buffer destructor a friend? so this can be protected */
+-   void release_buffer();
+-
+ protected:
+    /**
+     * @brief Initialize platform specifics.
+@@ -164,21 +162,11 @@ protected:
+     */
+    void destroy_image(swapchain_image &image) override;
+ 
+-   /**
+-    * @brief Method to check if there are any free images
+-    *
+-    * @return true if any images are free, otherwise false.
+-    */
+-   bool free_image_found();
+-
+    /**
+     * @brief Hook for any actions to free up a buffer for acquire
+     *
+     * @param[in,out] timeout time to wait, in nanoseconds. 0 doesn't block,
+-    *                        UINT64_MAX waits indefinitely. The timeout should
+-    *                        be updated if a sleep is required - this can
+-    *                        be set to 0 if the semaphore is now not expected
+-    *                        block.
++    *                        UINT64_MAX waits indefinitely.
+     */
+    VkResult get_free_buffer(uint64_t *timeout) override;
+ 
+@@ -187,7 +175,7 @@ protected:
+     *
+     * @param[in] image       The swapchain image for which to set a present payload.
+     * @param     queue       A Vulkan queue that can be used for any Vulkan commands needed.
+-    * @param[in] sem_payload Array of Vulkan semaphores that constitute the payload.
++    * @param[in] semaphores  Array of Vulkan semaphores that constitute the payload.
+     * @param[in] submission_pnext Chain of pointers to attach to the payload submission.
+     *
+     * @return VK_SUCCESS on success or an error code otherwise.
+@@ -197,6 +185,9 @@ protected:
+ 
+    VkResult image_wait_present(swapchain_image &image, uint64_t timeout) override;
+ 
++   /**
++    * @brief Process the X Present events already received, without blocking.
++    */
+    void update_pending_image_status() override;
+ 
+    /**
+@@ -214,57 +205,34 @@ protected:
+ 
+ private:
+    xcb_connection_t *m_connection;
+-   xcb_window_t      m_window;
+-   xcb_gc_t          m_gc;
+-   xcb_screen_t     *m_screen;
+-   xcb_pixmap_t      m_backing_pixmap;
+-   xcb_special_event_t *m_present_event;
+-   xcb_present_event_t m_event_id;
++   xcb_window_t m_window;
+ 
+-   uint64_t m_last_present_msc;
+-
+-   uint32_t m_window_width;                // width of m_window
+-   uint32_t m_window_height;               // height of m_window
++   /** Special event queue receiving the Present events of @ref m_window, or nullptr. */
++   xcb_special_event_t *m_present_event;
++   /** Event context id used with xcb_present_select_input. */
++   uint32_t m_event_id;
+ 
+    /**
+-    * @brief Allocates a Vulkan image with the specified image create info.
++    * @brief Serialises the processing of Present events.
+     *
+-    * @param image_create_info The create info for the Vulkan image.
+-    * @param image_data The x11_image_data structure to store the image data.
+-    * @return VkResult The result of the image allocation operation.
++    * Events are consumed both by the page flip thread (FIFO pacing) and by the application thread (waiting for a
++    * free image). Everything below is protected by this mutex.
+     */
+-   VkResult allocate_image(VkImageCreateInfo &image_create_info,
+-                           x11_image_data *image_data);
++   std::mutex m_event_mutex;
++   /** Signalled whenever Present events have been processed, wakes threads waiting on @ref m_event_mutex. */
++   std::condition_variable m_event_cv;
++   /** True while one thread is blocked in poll() on the X connection. */
++   bool m_event_poller_active;
++   /** MSC of the last completed present. */
++   uint64_t m_last_present_msc;
+ 
+-   /**
+-    * @brief Allocate a buffer from the WSI Allocator.
+-    *
+-    * This function allocates image resource, like importable formats, and allocated format.
+-    *
+-    * @param image_create_info The create info for the Vulkan image.
+-    * @param image_data The X11 image data.
+-    * @param importable_formats The list of importable formats.
+-    * @param allocated_format The allocated format.
+-    * @param avoid_allocation Indicates that the image should be real allocated.
+-    * @return VkResult The result of the allocation.
+-    */
+-   VkResult allocate_wsialloc(VkImageCreateInfo &image_create_info,
+-                              x11_image_data *image_data,
+-                              util::vector<wsialloc_format> &importable_formats,
+-                              wsialloc_format *allocated_format,
+-                              bool avoid_allocation);
++   uint32_t m_window_width;  // width of m_window when the swapchain was created
++   uint32_t m_window_height; // height of m_window when the swapchain was created
+ 
+-   /**
+-    * @brief Notifi xwayland to initializes an surface image.
+-    *
+-    * @param image_create_info The create info for the Vulkan image.
+-    * @param image_data The X11 image data.
+-    * @param creation_parameters The parameters for image creation.
+-    * @return VkResult The result of the image initialization.
+-    */
+-   VkResult x11_image_init(VkImageCreateInfo         image_create_info,
+-                           x11_image_data            *image_data,
+-                           image_creation_parameters &creation_parameters);
++   /** XCB_PRESENT_OPTION_COPY forced through DISABLE_XCB_FLIP. Read once at creation time. */
++   bool m_force_copy;
++   /** Use XCB_PRESENT_OPTION_ASYNC for MAILBOX (only on Xwayland, where async flips do not tear). */
++   bool m_mailbox_async;
+ 
+    /** Raw pointer to the WSI Surface that this swapchain was created from. The Vulkan specification ensures that the
+     * surface is valid until swapchain is destroyed. */
+@@ -280,24 +248,43 @@ private:
+     */
+    struct image_creation_parameters m_image_creation_parameters;
+ 
+-   /*
+-    * @brief Get the memory type which the specified file descriptor can be
+-    * imported as.
++   /**
++    * @brief Allocates the memory of a swapchain image using the format selected at swapchain creation.
++    */
++   VkResult allocate_image(x11_image_data *image_data);
++
++   /**
++    * @brief Allocate a buffer from the WSI Allocator.
+     *
+-    * @param      fd      The given fd.
+-    * @param[out] mem_idx The index of the supported memory type.
++    * @param image_create_info  The create info for the Vulkan image.
++    * @param image_data         The X11 image data.
++    * @param importable_formats The list of importable formats.
++    * @param allocated_format   The allocated format.
++    * @param avoid_allocation   Only select the format, do not allocate memory.
++    * @return VkResult The result of the allocation.
++    */
++   VkResult allocate_wsialloc(const VkImageCreateInfo &image_create_info, x11_image_data *image_data,
++                              util::vector<wsialloc_format> &importable_formats, wsialloc_format *allocated_format,
++                              bool avoid_allocation);
++
++   /**
++    * @brief Create the X pixmap and the X Sync fence of a swapchain image (DRI3).
+     *
+-    * @return VK_SUCCESS on success. On failure the error value of
+-    * vkGetMemoryFdPropertiesKHR is returned.
++    * @param image_create_info   The create info for the Vulkan image.
++    * @param image_data          The X11 image data.
++    * @param creation_parameters The parameters for image creation.
++    * @return VkResult The result of the image initialization.
+     */
+-   VkResult get_fd_mem_type_index(int fd, uint32_t &mem_idx);
++   VkResult x11_image_init(const VkImageCreateInfo &image_create_info, x11_image_data *image_data,
++                           const image_creation_parameters &creation_parameters);
+ 
+    /**
+     * @brief Finds what formats are compatible with the requested swapchain image Vulkan Device and Xcb surface.
+     *
+     * @param      info               The Swapchain image creation info.
+     * @param[out] importable_formats A list of formats that can be imported to the Vulkan Device.
+-    * @param[out] exportable_formats A list of formats that can be exported from the Vulkan Device.
++    * @param[out] exportable_modifers A list of modifiers that can be exported from the Vulkan Device.
++    * @param[out] drm_format_props   The DRM format modifier properties of the Vulkan format.
+     *
+     * @return VK_SUCCESS or VK_ERROR_OUT_OF_HOST_MEMORY
+     */
+@@ -305,9 +292,39 @@ private:
+                                            util::vector<wsialloc_format> &importable_formats,
+                                            util::vector<uint64_t> &exportable_modifers,
+                                            util::vector<VkDrmFormatModifierPropertiesEXT> &drm_format_props);
+-   void handle_dri3_present_event(xcb_present_generic_event_t *event);
+ 
+-   void poll_present_event_for_pending_image();
++   /**
++    * @brief Handle one Present event and free it. Must be called with @ref m_event_mutex held.
++    */
++   void handle_present_event_locked(xcb_present_generic_event_t *event);
++
++   /**
++    * @brief Process all queued Present events without blocking. Must be called with @ref m_event_mutex held.
++    *
++    * @return true if at least one event was processed.
++    */
++   bool drain_present_events_locked();
++
++   /**
++    * @brief Wait until @p done returns true, processing Present events meanwhile.
++    *
++    * @param abs_timeout Absolute CLOCK_MONOTONIC deadline in nanoseconds, UINT64_MAX for no deadline.
++    * @param done        Predicate evaluated with @ref m_event_mutex held.
++    *
++    * @return VK_SUCCESS, VK_TIMEOUT, or an error if the window or the connection is gone.
++    */
++   template <typename Predicate>
++   VkResult wait_for_present_events(uint64_t abs_timeout, Predicate done);
++
++   /**
++    * @brief Returns true if at least one image is FREE.
++    */
++   bool free_image_found();
++
++   /**
++    * @brief Return all images still owned by the X server to the FREE state (window or connection lost).
++    */
++   void release_server_owned_images();
+ };
+ } // namespace xcb
+ } // namespace wsi
+diff --git a/wsi/xcb/xcb_helpers.cpp b/wsi/xcb/xcb_helpers.cpp
+index 69a1e78..12a1f58 100644
+--- a/wsi/xcb/xcb_helpers.cpp
++++ b/wsi/xcb/xcb_helpers.cpp
+@@ -40,156 +40,224 @@
+ 
+ #include "xcb_helpers.hpp"
+ 
+-void connection_get_caps(xcb_connection_t *conn, struct connection_caps *conn_caps)
++#include <cstdlib>
++#include <cstring>
++
++namespace wsi
++{
++namespace xcb
+ {
+-   xcb_query_extension_cookie_t dri3_cookie, pres_cookie;
+-   xcb_query_extension_reply_t *dri3_reply, *pres_reply;
+ 
+-   dri3_cookie = xcb_query_extension(conn, 4, "DRI3");
+-   pres_cookie = xcb_query_extension(conn, 7, "Present");
++bool connection_get_caps(xcb_connection_t *conn, connection_caps *conn_caps)
++{
++   *conn_caps = connection_caps{};
+ 
+-   dri3_reply = xcb_query_extension_reply(conn, dri3_cookie, NULL);
+-   pres_reply = xcb_query_extension_reply(conn, pres_cookie, NULL);
++   if (conn == nullptr || xcb_connection_has_error(conn))
++   {
++      return false;
++   }
+ 
+-   conn_caps->has_dri3 = dri3_reply->present != 0;
+-   conn_caps->has_present = pres_reply->present != 0;
++   static const char dri3_name[] = "DRI3";
++   static const char present_name[] = "Present";
++   static const char xwayland_name[] = "XWAYLAND";
++
++   /* Send all the requests first, then collect the replies: one round trip instead of three. */
++   const xcb_query_extension_cookie_t dri3_cookie = xcb_query_extension(conn, strlen(dri3_name), dri3_name);
++   const xcb_query_extension_cookie_t pres_cookie = xcb_query_extension(conn, strlen(present_name), present_name);
++   const xcb_query_extension_cookie_t xwl_cookie = xcb_query_extension(conn, strlen(xwayland_name), xwayland_name);
++
++   xcb_query_extension_reply_t *dri3_reply = xcb_query_extension_reply(conn, dri3_cookie, nullptr);
++   xcb_query_extension_reply_t *pres_reply = xcb_query_extension_reply(conn, pres_cookie, nullptr);
++   xcb_query_extension_reply_t *xwl_reply = xcb_query_extension_reply(conn, xwl_cookie, nullptr);
++
++   /* Replies are NULL when the connection breaks: never dereference them blindly. */
++   const bool answered = (dri3_reply != nullptr) && (pres_reply != nullptr);
++   conn_caps->has_dri3 = (dri3_reply != nullptr) && dri3_reply->present;
++   conn_caps->has_present = (pres_reply != nullptr) && pres_reply->present;
++   conn_caps->is_xwayland = (xwl_reply != nullptr) && xwl_reply->present;
+ 
+    free(dri3_reply);
+    free(pres_reply);
++   free(xwl_reply);
++
++   if (conn_caps->has_dri3)
++   {
++      /* Advertise the highest version we know about; the server answers with the version it supports. */
++      xcb_dri3_query_version_reply_t *ver =
++         xcb_dri3_query_version_reply(conn, xcb_dri3_query_version(conn, 1, 2), nullptr);
++      if (ver != nullptr)
++      {
++         conn_caps->has_dri3_modifiers =
++            (ver->major_version > 1) || (ver->major_version == 1 && ver->minor_version >= 2);
++         free(ver);
++      }
++   }
++
++   if (conn_caps->has_present)
++   {
++      /* Present requires the client to announce its version before using the extension. */
++      xcb_present_query_version_reply_t *ver =
++         xcb_present_query_version_reply(conn, xcb_present_query_version(conn, 1, 2), nullptr);
++      if (ver == nullptr)
++      {
++         conn_caps->has_present = false;
++      }
++      free(ver);
++   }
++
++   return answered;
+ }
+ 
+-bool visual_supported(xcb_visualtype_t *visual)
++bool visual_supported(const xcb_visualtype_t *visual)
+ {
+-   if (!visual)
++   if (visual == nullptr)
++   {
+       return false;
++   }
+ 
+-   return visual->_class == XCB_VISUAL_CLASS_TRUE_COLOR ||
+-          visual->_class == XCB_VISUAL_CLASS_DIRECT_COLOR;
++   return visual->_class == XCB_VISUAL_CLASS_TRUE_COLOR || visual->_class == XCB_VISUAL_CLASS_DIRECT_COLOR;
+ }
+ 
+-xcb_visualtype_t *
+-screen_get_visualtype(xcb_screen_t *screen, xcb_visualid_t visual_id,
+-                      unsigned *depth)
++xcb_visualtype_t *screen_get_visualtype(xcb_screen_t *screen, xcb_visualid_t visual_id, unsigned *depth)
+ {
+-   xcb_depth_iterator_t depth_iter =
+-      xcb_screen_allowed_depths_iterator(screen);
+-
+-   for (; depth_iter.rem; xcb_depth_next (&depth_iter)) {
+-      xcb_visualtype_iterator_t visual_iter =
+-         xcb_depth_visuals_iterator (depth_iter.data);
+-
+-      for (; visual_iter.rem; xcb_visualtype_next (&visual_iter)) {
+-         if (visual_iter.data->visual_id == visual_id) {
+-            if (depth)
++   xcb_depth_iterator_t depth_iter = xcb_screen_allowed_depths_iterator(screen);
++
++   for (; depth_iter.rem; xcb_depth_next(&depth_iter))
++   {
++      xcb_visualtype_iterator_t visual_iter = xcb_depth_visuals_iterator(depth_iter.data);
++
++      for (; visual_iter.rem; xcb_visualtype_next(&visual_iter))
++      {
++         if (visual_iter.data->visual_id == visual_id)
++         {
++            if (depth != nullptr)
++            {
+                *depth = depth_iter.data->depth;
++            }
+             return visual_iter.data;
+          }
+       }
+    }
+ 
+-   return NULL;
++   return nullptr;
+ }
+ 
+-xcb_visualtype_t *
+-connection_get_visualtype(xcb_connection_t *conn, xcb_visualid_t visual_id)
++xcb_visualtype_t *connection_get_visualtype(xcb_connection_t *conn, xcb_visualid_t visual_id)
+ {
+-   xcb_screen_iterator_t screen_iter =
+-      xcb_setup_roots_iterator(xcb_get_setup(conn));
++   xcb_screen_iterator_t screen_iter = xcb_setup_roots_iterator(xcb_get_setup(conn));
+ 
+    /* For this we have to iterate over all of the screens which is rather
+     * annoying.  Fortunately, there is probably only 1.
+     */
+-   for (; screen_iter.rem; xcb_screen_next (&screen_iter)) {
+-      xcb_visualtype_t *visual = screen_get_visualtype(screen_iter.data,
+-                                                       visual_id, NULL);
+-      if (visual)
++   for (; screen_iter.rem; xcb_screen_next(&screen_iter))
++   {
++      xcb_visualtype_t *visual = screen_get_visualtype(screen_iter.data, visual_id, nullptr);
++      if (visual != nullptr)
++      {
+          return visual;
++      }
+    }
+ 
+-   return NULL;
++   return nullptr;
+ }
+ 
+-xcb_screen_t *
+-get_screen_for_root(xcb_connection_t *conn, xcb_window_t root)
++xcb_screen_t *get_screen_for_root(xcb_connection_t *conn, xcb_window_t root)
+ {
+-   xcb_screen_iterator_t screen_iter =
+-      xcb_setup_roots_iterator(xcb_get_setup(conn));
++   xcb_screen_iterator_t screen_iter = xcb_setup_roots_iterator(xcb_get_setup(conn));
+ 
+-   for (; screen_iter.rem; xcb_screen_next (&screen_iter)) {
++   for (; screen_iter.rem; xcb_screen_next(&screen_iter))
++   {
+       if (screen_iter.data->root == root)
++      {
+          return screen_iter.data;
++      }
+    }
+ 
+-   return NULL;
++   return nullptr;
+ }
+ 
+-xcb_visualtype_t *
+-get_visualtype_for_window(xcb_connection_t *conn, xcb_window_t window,
+-                          unsigned *depth)
++xcb_visualtype_t *get_visualtype_for_window(xcb_connection_t *conn, xcb_window_t window, unsigned *depth)
+ {
+-   xcb_query_tree_cookie_t tree_cookie;
+-   xcb_get_window_attributes_cookie_t attrib_cookie;
+-   xcb_query_tree_reply_t *tree;
+-   xcb_get_window_attributes_reply_t *attrib;
+-
+-   tree_cookie = xcb_query_tree(conn, window);
+-   attrib_cookie = xcb_get_window_attributes(conn, window);
++   const xcb_query_tree_cookie_t tree_cookie = xcb_query_tree(conn, window);
++   const xcb_get_window_attributes_cookie_t attrib_cookie = xcb_get_window_attributes(conn, window);
+ 
+-   tree = xcb_query_tree_reply(conn, tree_cookie, NULL);
+-   attrib = xcb_get_window_attributes_reply(conn, attrib_cookie, NULL);
+-   if (attrib == NULL || tree == NULL) {
++   xcb_query_tree_reply_t *tree = xcb_query_tree_reply(conn, tree_cookie, nullptr);
++   xcb_get_window_attributes_reply_t *attrib = xcb_get_window_attributes_reply(conn, attrib_cookie, nullptr);
++   if (attrib == nullptr || tree == nullptr)
++   {
+       free(attrib);
+       free(tree);
+-      return NULL;
++      return nullptr;
+    }
+ 
+-   xcb_window_t root = tree->root;
+-   xcb_visualid_t visual_id = attrib->visual;
++   const xcb_window_t root = tree->root;
++   const xcb_visualid_t visual_id = attrib->visual;
+    free(attrib);
+    free(tree);
+ 
+    xcb_screen_t *screen = get_screen_for_root(conn, root);
+-   if (screen == NULL)
+-      return NULL;
++   if (screen == nullptr)
++   {
++      return nullptr;
++   }
+ 
+    return screen_get_visualtype(screen, visual_id, depth);
+ }
+ 
+-bool
+-visual_has_alpha(xcb_visualtype_t *visual, unsigned depth)
++bool visual_has_alpha(const xcb_visualtype_t *visual, unsigned depth)
+ {
+-   uint32_t rgb_mask = visual->red_mask |
+-                       visual->green_mask |
+-                       visual->blue_mask;
++   if (visual == nullptr || depth == 0 || depth > 32)
++   {
++      return false;
++   }
+ 
+-   uint32_t all_mask = 0xffffffff >> (32 - depth);
++   const uint32_t rgb_mask = visual->red_mask | visual->green_mask | visual->blue_mask;
++   const uint32_t all_mask = 0xffffffffu >> (32 - depth);
+ 
+    /* Do we have bits left over after RGB? */
+    return (all_mask & ~rgb_mask) != 0;
+ }
+ 
+-void
+-set_adaptive_sync_property(xcb_connection_t *conn,
+-                           xcb_drawable_t drawable,
+-                           uint32_t state)
++bool window_exists(xcb_connection_t *conn, xcb_window_t window)
++{
++   if (xcb_connection_has_error(conn))
++   {
++      return false;
++   }
++
++   xcb_generic_error_t *error = nullptr;
++   xcb_get_window_attributes_reply_t *reply =
++      xcb_get_window_attributes_reply(conn, xcb_get_window_attributes(conn, window), &error);
++   const bool exists = (reply != nullptr);
++   free(reply);
++   free(error);
++   return exists;
++}
++
++void set_adaptive_sync_property(xcb_connection_t *conn, xcb_drawable_t drawable, uint32_t state)
+ {
+    static char const name[] = "_VARIABLE_REFRESH";
+-   xcb_intern_atom_cookie_t cookie;
+-   xcb_intern_atom_reply_t* reply;
+-   xcb_void_cookie_t check;
+ 
+-   cookie = xcb_intern_atom(conn, 0, strlen(name), name);
+-   reply = xcb_intern_atom_reply(conn, cookie, NULL);
+-   if (reply == NULL)
++   xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(conn, xcb_intern_atom(conn, 0, strlen(name), name), nullptr);
++   if (reply == nullptr)
++   {
+       return;
++   }
+ 
++   xcb_void_cookie_t check;
+    if (state)
+-      check = xcb_change_property_checked(conn, XCB_PROP_MODE_REPLACE,
+-                                          drawable, reply->atom,
+-                                          XCB_ATOM_CARDINAL, 32, 1, &state);
++   {
++      check = xcb_change_property_checked(conn, XCB_PROP_MODE_REPLACE, drawable, reply->atom, XCB_ATOM_CARDINAL, 32, 1,
++                                          &state);
++   }
+    else
++   {
+       check = xcb_delete_property_checked(conn, drawable, reply->atom);
++   }
+ 
+    xcb_discard_reply(conn, check.sequence);
+    free(reply);
+ }
++
++} // namespace xcb
++} // namespace wsi
+diff --git a/wsi/xcb/xcb_helpers.hpp b/wsi/xcb/xcb_helpers.hpp
+index f01e39d..dfc19e4 100644
+--- a/wsi/xcb/xcb_helpers.hpp
++++ b/wsi/xcb/xcb_helpers.hpp
+@@ -38,67 +38,71 @@
+  * SOFTWARE.
+  */
+ 
++/**
++ * @file xcb_helpers.hpp
++ *
++ * @brief Small X11/XCB helpers used by the XCB WSI backend.
++ */
++
+ #pragma once
+ 
+-#include <stdint.h>
++#include <cstdint>
+ 
+-#include <X11/Xlib-xcb.h>
+-extern "C" {
+-#include <X11/xshmfence.h>
+-}
+ #include <xcb/xcb.h>
+ #include <xcb/dri3.h>
+ #include <xcb/present.h>
+-#include <xcb/shm.h>
+ 
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <unistd.h>
+-#include <sys/mman.h>
+-
+-#include <cstdint>
+-#include <cstring>
+-#include <cassert>
+-#include <unistd.h>
+-#include <cstdlib>
+-#include <cerrno>
+-#include <cstdio>
+-#include <climits>
+-#include <functional>
++namespace wsi
++{
++namespace xcb
++{
+ 
++/**
++ * @brief Capabilities of an X server connection relevant to the WSI backend.
++ */
+ struct connection_caps
+ {
+-   bool has_dri3;
+-   bool has_present;
++   /** DRI3 extension available. */
++   bool has_dri3{ false };
++   /** DRI3 >= 1.2: PixmapFromBuffers and GetSupportedModifiers (multi-plane, format modifiers). */
++   bool has_dri3_modifiers{ false };
++   /** Present extension available. */
++   bool has_present{ false };
++   /** The server is Xwayland (detected through the XWAYLAND extension, Xwayland >= 23.1). */
++   bool is_xwayland{ false };
+ };
+ 
+-void connection_get_caps(xcb_connection_t *conn, struct connection_caps *conn_caps);
+-
+-bool visual_supported(xcb_visualtype_t *visual);
++/**
++ * @brief Query the capabilities of an X server connection.
++ *
++ * @param      conn      The XCB connection.
++ * @param[out] conn_caps The capabilities. All fields are false on failure.
++ *
++ * @return false if the connection is broken or the server did not answer, true otherwise.
++ */
++bool connection_get_caps(xcb_connection_t *conn, connection_caps *conn_caps);
+ 
+-xcb_visualtype_t *
+-screen_get_visualtype(xcb_screen_t *screen,
+-                      xcb_visualid_t visual_id,
+-                      unsigned *depth);
++bool visual_supported(const xcb_visualtype_t *visual);
+ 
+-xcb_visualtype_t *
+-connection_get_visualtype(xcb_connection_t *conn,
+-                          xcb_visualid_t visual_id);
++xcb_visualtype_t *screen_get_visualtype(xcb_screen_t *screen, xcb_visualid_t visual_id, unsigned *depth);
+ 
+-xcb_screen_t *
+-get_screen_for_root(xcb_connection_t *conn, xcb_window_t root);
++xcb_visualtype_t *connection_get_visualtype(xcb_connection_t *conn, xcb_visualid_t visual_id);
+ 
+-xcb_visualtype_t *
+-get_visualtype_for_window(xcb_connection_t *conn, xcb_window_t window,
+-                          unsigned *depth);
++xcb_screen_t *get_screen_for_root(xcb_connection_t *conn, xcb_window_t root);
+ 
+-bool
+-visual_has_alpha(xcb_visualtype_t *visual, unsigned depth);
++xcb_visualtype_t *get_visualtype_for_window(xcb_connection_t *conn, xcb_window_t window, unsigned *depth);
+ 
+-void
+-set_adaptive_sync_property(xcb_connection_t *conn,
+-                           xcb_drawable_t drawable,
+-                           uint32_t state);
++/**
++ * @brief Returns true if the visual has bits that are not used by the RGB channels (i.e. an alpha channel).
++ */
++bool visual_has_alpha(const xcb_visualtype_t *visual, unsigned depth);
+ 
++/**
++ * @brief Returns true if the window still exists on the server. Performs a round trip.
++ */
++bool window_exists(xcb_connection_t *conn, xcb_window_t window);
+ 
++void set_adaptive_sync_property(xcb_connection_t *conn, xcb_drawable_t drawable, uint32_t state);
+ 
++} // namespace xcb
++} // namespace wsi
